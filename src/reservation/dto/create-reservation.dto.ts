@@ -1,3 +1,4 @@
+import { ApiProperty } from '@nestjs/swagger';
 import { Type } from 'class-transformer';
 import {
   IsArray,
@@ -9,38 +10,45 @@ import {
 } from 'class-validator';
 
 export class ReservationItemDto {
+  @ApiProperty({ example: 1, description: '빵 ID' })
   @IsNotEmpty()
   @IsInt()
   breadId: number;
 
+  @ApiProperty({ example: 2, description: '예약 수량 (1 이상)', minimum: 1 })
   @IsInt()
   @Min(1)
   qty: number;
 }
 
-/**
- * POST /v1/reservations/hold 요청 바디.
- * 한 매장에서 여러 빵을 동시에 hold 요청.
- */
 export class CreateHoldDto {
+  @ApiProperty({ example: 1, description: '예약 사용자 ID' })
   @IsNotEmpty()
   @IsInt()
   userId: number;
 
+  @ApiProperty({ example: 1, description: '예약 대상 매장 ID' })
   @IsNotEmpty()
   @IsInt()
   storeId: number;
 
-  /**
-   * ISO 8601 형식 (e.g. "2026-03-15T18:30:00").
-   * 서비스 레이어에서 multi-step 검증 적용:
-   *   1) 파싱 가능 여부
-   *   2) 현재 이후 시간인지
-   *   3) 영업시간(09:00–21:00) 범위인지
-   */
+  @ApiProperty({
+    example: '2026-05-08T14:00:00',
+    description:
+      '픽업 예정 시각 (ISO 8601). ' +
+      '현재 시각 이후여야 하며 매장 영업시간(open_time ~ close_time) 범위 내여야 합니다.',
+  })
   @IsDateString()
   pickupTime: string;
 
+  @ApiProperty({
+    type: [ReservationItemDto],
+    description: '예약할 빵 목록 (한 매장에서 여러 종류 동시 예약 가능)',
+    example: [
+      { breadId: 1, qty: 2 },
+      { breadId: 3, qty: 1 },
+    ],
+  })
   @IsArray()
   @ValidateNested({ each: true })
   @Type(() => ReservationItemDto)
