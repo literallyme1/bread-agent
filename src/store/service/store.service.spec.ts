@@ -180,6 +180,16 @@ describe('StoreService', () => {
         expect.objectContaining({ breadName: '소금빵집' }),
       );
     });
+
+    it('preference 배열 전달 시 repository에 배열 그대로 위임 (OR 조건)', async () => {
+      storeRepository.findStoresWithBreads.mockResolvedValue([]);
+
+      await service.getStores({ station: '대전역', preference: ['짭짤', '바삭'] });
+
+      expect(storeRepository.findStoresWithBreads).toHaveBeenCalledWith(
+        expect.objectContaining({ preference: ['짭짤', '바삭'] }),
+      );
+    });
   });
 
   // ─── getStoreById ────────────────────────────────────────────────────────────

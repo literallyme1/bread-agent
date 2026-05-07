@@ -1,5 +1,6 @@
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
-import { IsNotEmpty, IsOptional, IsString } from 'class-validator';
+import { Transform } from 'class-transformer';
+import { IsArray, IsNotEmpty, IsOptional, IsString } from 'class-validator';
 
 export class StoreQueryDto {
   @ApiProperty({
@@ -19,12 +20,17 @@ export class StoreQueryDto {
   breadName?: string;
 
   @ApiPropertyOptional({
-    example: '짭짤',
-    description: '태그(preference) — exact match',
+    type: [String],
+    example: ['짭짤', '바삭'],
+    description:
+      '태그(preference) 필터 — exact match, 여러 개 전달 시 OR 조건 적용\n' +
+      '(e.g. ?preference=짭짤&preference=바삭)',
   })
   @IsOptional()
-  @IsString()
-  preference?: string;
+  @IsArray()
+  @IsString({ each: true })
+  @Transform(({ value }) => (Array.isArray(value) ? value : [value]))
+  preference?: string[];
 
   @ApiPropertyOptional({
     example: '하레하레',
