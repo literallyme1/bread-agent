@@ -24,7 +24,8 @@ export class StoreController {
     description:
       '역 이름 기준으로 매장·재고·태그를 한 번에 조회합니다. ' +
       'storeName / breadName은 pg_trgm 유사 검색이 적용되어 오타를 보완합니다. ' +
-      'preference는 정확히 일치하는 태그만 반환합니다.',
+      'preference는 exact match이며 여러 개 전달 시 OR 조건으로 동작합니다 ' +
+      '(e.g. ?preference=짭짤&preference=바삭).',
   })
   @ApiOkResponse({
     description: '매장 목록 반환',
