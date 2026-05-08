@@ -29,6 +29,7 @@ export class ReservationController {
    */
   @Post('hold')
   @ApiOperation({
+    operationId: 'holdReservation',
     summary: '재고 임시 hold 생성',
     description:
       '픽업 시각 검증 → 재고 확인 → Redis에 holdToken 저장 (TTL 2분). ' +
@@ -68,6 +69,7 @@ export class ReservationController {
    */
   @Post('confirm')
   @ApiOperation({
+    operationId: 'confirmReservation',
     summary: 'Hold 확정 → 예약 생성',
     description:
       'holdToken 기반으로 Redis Hold를 조회하고 DB에 예약을 확정합니다. ' +
@@ -114,7 +116,7 @@ export class ReservationController {
    * GET /v1/reservations/:id
    */
   @Get(':id')
-  @ApiOperation({ summary: '예약 단건 조회' })
+  @ApiOperation({ operationId: 'findReservation', summary: '예약 단건 조회' })
   @ApiOkResponse({
     description: '예약 정보',
     schema: {
@@ -147,6 +149,7 @@ export class ReservationController {
    */
   @Post(':id/cancel')
   @ApiOperation({
+    operationId: 'cancelReservation',
     summary: '예약 취소',
     description:
       'userId 권한 검증 후 CANCELLED 상태로 변경합니다. ' +
