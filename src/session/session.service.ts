@@ -1,0 +1,126 @@
+import {
+  BadRequestException,
+  Injectable,
+  Logger,
+  NotFoundException,
+} from '@nestjs/common';
+import { RedisHoldService } from '../redis/redis.service';
+import {
+  CurrentSession,
+  RedisUserSession,
+  RedisUserSessionSchema,
+  SessionStatusType,
+} from '../redis/session.schema';
+import {
+  getAllowedNextStatuses,
+  isValidTransition,
+} from './session-state.validator';
+
+@Injectable()
+export class SessionService {
+  private readonly logger = new Logger(SessionService.name);
+
+  constructor(private readonly redisService: RedisHoldService) {}
+
+  /**
+   * 사용자의 전체 Redis 세션(Profile + CurrentSession)을 조회합니다.
+   * 세션이 존재하지 않으면 NotFoundException을 던집니다.
+   */
+  async getSession(userId: string): Promise<RedisUserSession> {
+    const session = await this.redisService.getSession(userId);
+    if (!session) {
+      throw new NotFoundException(`Session not found for userId: ${userId}`);
+    }
+    return session;
+  }
+
+  /**
+   * current_session을 Partial Update(PATCH)합니다.
+   * Body에 포함된 필드만 기존 세션에 병합하며, 나머지 필드는 그대로 유지됩니다.
+   * AI 에이전트가 의도에 따라 상태를 전이하거나 세션 필드를 수정할 때 사용합니다.
+   *
+   * 처리 순서:
+   *   1. Zod safeParse로 patch 구조 검증
+   *   2. status 필드가 포함된 경우에만 상태 전이 규칙 검증
+   *   3. 기존 세션에 병합 후 RedisUserSessionSchema.safeParse()로 최종 검증
+   *   4. Redis 저장
+   */
+  async patchSession(userId: string, patch: Partial<CurrentSession>): Promise<RedisUserSession> {
+    const existing = await this.redisService.getSession(userId);
+    if (!existing) {
+      throw new NotFoundException(`Session not found for userId: ${userId}`);
+    }
+
+    // status 필드가 포함된 경우에만 상태 전이 규칙 검증
+    if (patch.status !== undefined) {
+      this.validateTransition(existing.current_session?.status, patch.status, userId);
+    }
+
+    const updated: RedisUserSession = {
+      ...existing,
+      current_session: {
+        ...existing.current_session,
+        ...patch,
+      } as CurrentSession,
+    };
+
+    const validated = RedisUserSessionSchema.safeParse(updated);
+    if (!validated.success) {
+      this.logger.error(
+        `[patchSession] schema validation failed userId=${userId}: ${validated.error.message}`,
+      );
+      throw new BadRequestException('Session data failed schema validation');
+    }
+
+    await this.redisService.setSession(userId, validated.data);
+    this.logger.log(
+      `[patchSession] userId=${userId} patched fields=[${Object.keys(patch).join(', ')}]`,
+    );
+
+    return validated.data;
+  }
+
+  /**
+   * 상태 전이 규칙을 검증합니다.
+   * current가 undefined(초기 세션)인 경우 모든 상태 설정을 허용합니다.
+   * 허용되지 않는 전이 시 400 BadRequestException을 던집니다.
+   */
+  private validateTransition(
+    current: SessionStatusType | undefined,
+    next: SessionStatusType,
+    userId: string,
+  ): void {
+    if (current === undefined) {
+      // 아직 status가 없는 초기 세션 → 어떤 상태든 최초 설정 허용
+      return;
+    }
+
+    if (!isValidTransition(current, next)) {
+      const allowed = getAllowedNextStatuses(current).join(', ');
+      this.logger.warn(
+        `[validateTransition] invalid transition userId=${userId} ${current} → ${next} (allowed: ${allowed})`,
+      );
+      throw new BadRequestException(
+        `현재 ${current}에서 ${next}로의 변경은 허용되지 않습니다. ` +
+          `(${current}에서 허용된 다음 상태: ${allowed})`,
+      );
+    }
+
+    this.logger.log(
+      `[validateTransition] valid transition userId=${userId} ${current} → ${next}`,
+    );
+  }
+
+  /**
+   * 사용자의 Redis 세션 전체를 삭제합니다.
+   * 세션이 존재하지 않으면 NotFoundException을 던집니다.
+   */
+  async deleteSession(userId: string): Promise<void> {
+    const existing = await this.redisService.getSession(userId);
+    if (!existing) {
+      throw new NotFoundException(`Session not found for userId: ${userId}`);
+    }
+    await this.redisService.deleteSession(userId);
+    this.logger.log(`[deleteSession] session deleted userId=${userId}`);
+  }
+}
