@@ -5,6 +5,8 @@ import { StoreQueryDto } from '../dto/store-query.dto';
 import { CustomException } from '../../common/exception/custom.exception';
 import { ErrorCode } from '../../common/exception/error-code.enum';
 import { Store } from '../entity/store.entity';
+import { Preference } from '../../common/enums/preference.enum';
+import { Station } from '../../common/enums/station.enum';
 
 describe('StoreService', () => {
   let service: StoreService;
@@ -48,7 +50,7 @@ describe('StoreService', () => {
       ];
       storeRepository.findStoresWithBreads.mockResolvedValue(rawRows);
 
-      const query: StoreQueryDto = { station: '대전역' };
+      const query: StoreQueryDto = { station: Station.DAEJEON };
       const result = await service.getStores(query);
 
       expect(result.stores).toHaveLength(1);
@@ -83,14 +85,14 @@ describe('StoreService', () => {
       ];
       storeRepository.findStoresWithBreads.mockResolvedValue(rawRows);
 
-      const result = await service.getStores({ station: '대전역' });
+      const result = await service.getStores({ station: Station.DAEJEON });
       expect(result.stores[0].breads[0].preferences).toEqual([]);
     });
 
     it('결과가 없으면 빈 stores 배열 반환', async () => {
       storeRepository.findStoresWithBreads.mockResolvedValue([]);
 
-      const result = await service.getStores({ station: '없는역' });
+      const result = await service.getStores({ station: '없는역' as Station });
       expect(result.stores).toHaveLength(0);
     });
 
@@ -113,7 +115,7 @@ describe('StoreService', () => {
       ];
       storeRepository.findStoresWithBreads.mockResolvedValue(rawRows);
 
-      const result = await service.getStores({ station: '대전역' });
+      const result = await service.getStores({ station: Station.DAEJEON });
       expect(result.stores[0].breads).toHaveLength(0);
     });
 
@@ -150,7 +152,7 @@ describe('StoreService', () => {
       ];
       storeRepository.findStoresWithBreads.mockResolvedValue(rawRows);
 
-      const result = await service.getStores({ station: '대전역' });
+      const result = await service.getStores({ station: Station.DAEJEON });
 
       expect(result.stores).toHaveLength(2);
       expect(result.stores[0].name).toBe('성심당');
@@ -164,7 +166,7 @@ describe('StoreService', () => {
     it('storeName 전달 시 repository에 query 그대로 위임', async () => {
       storeRepository.findStoresWithBreads.mockResolvedValue([]);
 
-      await service.getStores({ station: '대전역', storeName: '하래하래' });
+      await service.getStores({ station: Station.DAEJEON, storeName: '하래하래' });
 
       expect(storeRepository.findStoresWithBreads).toHaveBeenCalledWith(
         expect.objectContaining({ storeName: '하래하래' }),
@@ -174,7 +176,7 @@ describe('StoreService', () => {
     it('breadName 전달 시 repository에 query 그대로 위임 (오타 보완 대상)', async () => {
       storeRepository.findStoresWithBreads.mockResolvedValue([]);
 
-      await service.getStores({ station: '대전역', breadName: '소금빵집' });
+      await service.getStores({ station: Station.DAEJEON, breadName: '소금빵집' });
 
       expect(storeRepository.findStoresWithBreads).toHaveBeenCalledWith(
         expect.objectContaining({ breadName: '소금빵집' }),
@@ -184,10 +186,13 @@ describe('StoreService', () => {
     it('preference 배열 전달 시 repository에 배열 그대로 위임 (OR 조건)', async () => {
       storeRepository.findStoresWithBreads.mockResolvedValue([]);
 
-      await service.getStores({ station: '대전역', preference: ['짭짤', '바삭'] });
+      await service.getStores({
+        station: Station.DAEJEON,
+        preference: [Preference.SALTY, Preference.CRISPY],
+      });
 
       expect(storeRepository.findStoresWithBreads).toHaveBeenCalledWith(
-        expect.objectContaining({ preference: ['짭짤', '바삭'] }),
+        expect.objectContaining({ preference: [Preference.SALTY, Preference.CRISPY] }),
       );
     });
   });

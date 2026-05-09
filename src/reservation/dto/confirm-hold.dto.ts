@@ -1,17 +1,12 @@
-import { ApiProperty } from '@nestjs/swagger';
-import { IsInt, IsNotEmpty, IsString } from 'class-validator';
+import { createZodDto } from 'nestjs-zod';
+import { z } from 'zod';
 
-export class ConfirmHoldDto {
-  @ApiProperty({ example: 1, description: '예약 사용자 ID' })
-  @IsNotEmpty()
-  @IsInt()
-  userId: number;
+const ConfirmHoldSchema = z.object({
+  userId: z.number().int().describe('예약 사용자 ID'),
 
-  @ApiProperty({
-    example: 'a1b2c3d4-e5f6-7890-abcd-ef1234567890',
-    description: 'hold 생성 시 발급된 토큰 (TTL 2분)',
-  })
-  @IsNotEmpty()
-  @IsString()
-  holdToken: string;
-}
+  holdToken: z
+    .string()
+    .describe('hold 생성 시 발급된 토큰 (TTL 2분)'),
+});
+
+export class ConfirmHoldDto extends createZodDto(ConfirmHoldSchema) {}
