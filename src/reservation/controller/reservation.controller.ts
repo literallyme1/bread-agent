@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Logger, Param, ParseIntPipe, Post } from '@nestjs/common';
+import { Body, Controller, Get, Logger, Param, ParseIntPipe, Post, Query } from '@nestjs/common';
 import {
   ApiBadRequestResponse,
   ApiConflictResponse,
@@ -6,6 +6,7 @@ import {
   ApiNotFoundResponse,
   ApiOkResponse,
   ApiOperation,
+  ApiQuery,
   ApiTags,
 } from '@nestjs/swagger';
 import { ReservationService } from '../service/reservation.service';
@@ -17,6 +18,10 @@ import {
   CancelReservationResponseDto,
   ReservationResponseDto,
 } from '../dto/reservation-response.dto';
+import {
+  ReservationListEntry,
+  ReservationListQueryDto,
+} from '../dto/reservation-list.dto';
 import { ApiResponse, errorSchema } from '../../common/dto/api-response.dto';
 
 @ApiTags('Reservations')
@@ -116,6 +121,108 @@ export class ReservationController {
     const data = await this.reservationService.confirmHold(dto);
     this.logger.log(`[confirmHold] userId=${dto.userId} reservationId=${data.id} status=${data.status}`);
     return ApiResponse.success(data, 'Reservation confirmed successfully');
+  }
+
+  /**
+   * GET /v1/reservations
+   * userId + status(confirmed|cancelled) 로 예약 목록을 조회합니다.
+   */
+  @Get()
+  @ApiOperation({
+    operationId: 'listReservations',
+    summary: '예약 목록 조회',
+    description:
+      'userId와 status 필터로 사용자의 예약 내역을 조회합니다. ' +
+      'status는 confirmed(확정) 또는 cancelled(취소) 중 하나를 전달해야 합니다. ' +
+      '결과는 생성일 기준 최신순으로 반환됩니다.',
+  })
+  @ApiQuery({
+    name: 'userId',
+    type: Number,
+    description: '조회할 사용자 ID',
+    example: 1,
+  })
+  @ApiQuery({
+    name: 'status',
+    enum: ['confirmed', 'cancelled'],
+    description: '예약 상태 필터 (confirmed: 확정 내역 | cancelled: 취소 내역)',
+    example: 'confirmed',
+  })
+  @ApiOkResponse({
+    description: '예약 목록 반환 성공',
+    schema: {
+      properties: {
+        data: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              id: { type: 'integer', example: 1, description: '예약 ID' },
+              userId: { type: 'integer', example: 1, description: '사용자 ID' },
+              status: {
+                type: 'string',
+                enum: ['CONFIRMED', 'CANCELLED'],
+                example: 'CONFIRMED',
+                description: '예약 상태 (CONFIRMED: 확정 | CANCELLED: 취소)',
+              },
+              pickupTime: {
+                type: 'string',
+                example: '2026-05-08T14:00:00.000Z',
+                description: '픽업 예정 시각 (ISO 8601)',
+              },
+              createdAt: {
+                type: 'string',
+                example: '2026-05-07T10:00:00.000Z',
+                description: '예약 생성 시각 (ISO 8601)',
+              },
+              items: {
+                type: 'array',
+                items: {
+                  type: 'object',
+                  properties: {
+                    id: { type: 'integer', example: 1, description: '예약 아이템 ID' },
+                    inventoryId: { type: 'integer', example: 10, description: '재고 ID' },
+                    qty: { type: 'integer', example: 2, description: '예약 수량' },
+                  },
+                },
+              },
+            },
+          },
+        },
+        message: { type: 'string', example: 'Reservations fetched successfully' },
+      },
+      example: {
+        data: [
+          {
+            id: 1,
+            userId: 1,
+            status: 'CONFIRMED',
+            pickupTime: '2026-05-08T14:00:00.000Z',
+            createdAt: '2026-05-07T10:00:00.000Z',
+            items: [
+              { id: 1, inventoryId: 10, qty: 2 },
+              { id: 2, inventoryId: 20, qty: 1 },
+            ],
+          },
+        ],
+        message: 'Reservations fetched successfully',
+      },
+    },
+  })
+  @ApiBadRequestResponse({
+    description: '잘못된 쿼리 파라미터 (userId 미입력, status 범위 오류 등)',
+    schema: errorSchema('Validation failed'),
+  })
+  async listReservations(
+    @Query() query: ReservationListQueryDto,
+  ): Promise<ApiResponse<ReservationListEntry[]>> {
+    this.logger.log(`[listReservations] userId=${query.userId} status=${query.status}`);
+    const data = await this.reservationService.getReservationList(
+      query.userId,
+      query.status as 'confirmed' | 'cancelled',
+    );
+    this.logger.log(`[listReservations] userId=${query.userId} count=${data.length}`);
+    return ApiResponse.success(data, 'Reservations fetched successfully');
   }
 
   /**
