@@ -531,6 +531,44 @@
           "Reservations"
         ]
       }
+    },
+    "/v1/ai/chat": {
+      "post": {
+        "description": "Bread-Path AI 에이전트에게 메시지를 전송하고 응답을 받습니다. 에이전트는 매장 조회·재고 확인·예약 등의 API를 자율적으로 호출하여 답변합니다.",
+        "operationId": "aiChat",
+        "parameters": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ChatRequestDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "AI 응답 반환",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "example": {
+                    "data": {
+                      "reply": "강남역 근처 소금빵 재고가 있는 매장을 찾았습니다. ..."
+                    },
+                    "message": "OK"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "summary": "AI 에이전트 대화",
+        "tags": [
+          "AI"
+        ]
+      }
     }
   },
   "info": {
@@ -626,6 +664,26 @@
         },
         "required": [
           "userId"
+        ]
+      },
+      "ChatRequestDto": {
+        "type": "object",
+        "properties": {
+          "userId": {
+            "type": "integer",
+            "minimum": -9007199254740991,
+            "maximum": 9007199254740991,
+            "description": "요청 사용자 ID"
+          },
+          "message": {
+            "type": "string",
+            "minLength": 1,
+            "description": "AI 에이전트에게 전달할 메시지"
+          }
+        },
+        "required": [
+          "userId",
+          "message"
         ]
       }
     }
