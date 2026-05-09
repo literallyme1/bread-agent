@@ -62,13 +62,13 @@ export class StoreRepository {
       );
     }
 
-    if (query.preference) {
-      // 태그는 exact match 유지 (유사 검색 제외)
+    if (query.preference && query.preference.length > 0) {
+      // 태그 exact match, 복수 전달 시 OR 조건 (하나라도 포함된 inventory 반환)
       qb.andWhere(
         `inv.id IN (
           SELECT it2.inventory_id FROM inventory_tag it2
           JOIN tag t2 ON t2.id = it2.tag_id
-          WHERE t2.name = :preference
+          WHERE t2.name IN (:...preference)
         )`,
         { preference: query.preference },
       );

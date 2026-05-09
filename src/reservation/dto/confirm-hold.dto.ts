@@ -1,15 +1,12 @@
-import { IsInt, IsNotEmpty, IsString } from 'class-validator';
+import { createZodDto } from 'nestjs-zod';
+import { z } from 'zod';
 
-/**
- * POST /v1/reservations/confirm 요청 바디.
- * holdToken 기반으로 Redis Hold → DB Reservation 확정.
- */
-export class ConfirmHoldDto {
-  @IsNotEmpty()
-  @IsInt()
-  userId: number;
+const ConfirmHoldSchema = z.object({
+  userId: z.number().int().describe('예약 사용자 ID'),
 
-  @IsNotEmpty()
-  @IsString()
-  holdToken: string;
-}
+  holdToken: z
+    .string()
+    .describe('hold 생성 시 발급된 토큰 (TTL 2분)'),
+});
+
+export class ConfirmHoldDto extends createZodDto(ConfirmHoldSchema) {}
