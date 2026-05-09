@@ -1,4 +1,4 @@
-import { Controller, Get, Param, ParseIntPipe, Query } from '@nestjs/common';
+import { Controller, Get, Logger, Param, ParseIntPipe, Query } from '@nestjs/common';
 import {
   ApiNotFoundResponse,
   ApiOkResponse,
@@ -13,6 +13,8 @@ import { StoreDetailDto, StoreListResponseDto } from '../dto/store-response.dto'
 @ApiTags('Stores')
 @Controller('v1/stores')
 export class StoreController {
+  private readonly logger = new Logger(StoreController.name);
+
   constructor(private readonly storeService: StoreService) {}
 
   /**
@@ -58,7 +60,9 @@ export class StoreController {
     },
   })
   async getStores(@Query() query: StoreQueryDto): Promise<ApiResponse<StoreListResponseDto>> {
+    this.logger.log(`[getStores] station=${query.station} breadName=${query.breadName ?? '-'} storeName=${query.storeName ?? '-'} preference=${(query.preference ?? []).join(',') || '-'}`);
     const data = await this.storeService.getStores(query);
+    this.logger.log(`[getStores] station=${query.station} result.count=${data.stores.length}`);
     return ApiResponse.success(data, 'Stores fetched successfully');
   }
 
@@ -94,7 +98,9 @@ export class StoreController {
   async getStore(
     @Param('id', ParseIntPipe) id: number,
   ): Promise<ApiResponse<StoreDetailDto>> {
+    this.logger.log(`[getStore] id=${id}`);
     const data = await this.storeService.getStoreById(id);
+    this.logger.log(`[getStore] id=${id} name="${data.name}"`);
     return ApiResponse.success(data, 'Store fetched successfully');
   }
 }

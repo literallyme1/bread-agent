@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Param, ParseIntPipe, Post } from '@nestjs/common';
+import { Body, Controller, Get, Logger, Param, ParseIntPipe, Post } from '@nestjs/common';
 import {
   ApiBadRequestResponse,
   ApiConflictResponse,
@@ -22,6 +22,8 @@ import { ApiResponse, errorSchema } from '../../common/dto/api-response.dto';
 @ApiTags('Reservations')
 @Controller('v1/reservations')
 export class ReservationController {
+  private readonly logger = new Logger(ReservationController.name);
+
   constructor(private readonly reservationService: ReservationService) {}
 
   /**
@@ -60,7 +62,9 @@ export class ReservationController {
     schema: errorSchema('Store not found'),
   })
   async holdReservation(@Body() dto: CreateHoldDto): Promise<ApiResponse<HoldResponseDto>> {
+    this.logger.log(`[holdReservation] userId=${dto.userId} storeId=${dto.storeId} items=${dto.items.length} pickupTime=${dto.pickupTime}`);
     const data = await this.reservationService.holdReservation(dto);
+    this.logger.log(`[holdReservation] userId=${dto.userId} holdToken=${data.holdToken}`);
     return ApiResponse.success(data, 'Hold created successfully');
   }
 
@@ -108,7 +112,9 @@ export class ReservationController {
     schema: errorSchema('Hold token has expired'),
   })
   async confirmHold(@Body() dto: ConfirmHoldDto): Promise<ApiResponse<ReservationResponseDto>> {
+    this.logger.log(`[confirmHold] userId=${dto.userId} holdToken=${dto.holdToken}`);
     const data = await this.reservationService.confirmHold(dto);
+    this.logger.log(`[confirmHold] userId=${dto.userId} reservationId=${data.id} status=${data.status}`);
     return ApiResponse.success(data, 'Reservation confirmed successfully');
   }
 
@@ -140,7 +146,9 @@ export class ReservationController {
   async getReservation(
     @Param('id', ParseIntPipe) id: number,
   ): Promise<ApiResponse<ReservationResponseDto>> {
+    this.logger.log(`[getReservation] id=${id}`);
     const data = await this.reservationService.getReservation(id);
+    this.logger.log(`[getReservation] id=${id} status=${data.status}`);
     return ApiResponse.success(data, 'Reservation fetched successfully');
   }
 
@@ -181,7 +189,9 @@ export class ReservationController {
     @Param('id', ParseIntPipe) id: number,
     @Body() dto: CancelReservationDto,
   ): Promise<ApiResponse<CancelReservationResponseDto>> {
+    this.logger.log(`[cancelReservation] id=${id} userId=${dto.userId}`);
     const data = await this.reservationService.cancelReservation(id, dto);
+    this.logger.log(`[cancelReservation] id=${id} status=${data.status} feeMessage="${data.feeMessage}"`);
     return ApiResponse.success(data, 'Reservation cancelled successfully');
   }
 }
