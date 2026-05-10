@@ -9,12 +9,24 @@ import {
   CurrentSession,
   RedisUserSession,
   RedisUserSessionSchema,
+  SessionStatus,
   SessionStatusType,
 } from '../redis/session.schema';
 import {
   getAllowedNextStatuses,
   isValidTransition,
 } from './session-state.validator';
+
+/**
+ * READY_FOR_SUMMARY 상태에서 수정될 경우 SEARCHING으로 롤백해야 하는 정보 수집 필드 목록.
+ * 이 필드들이 변경되면 수집된 정보가 달라진 것이므로 요약 승인 흐름을 재시작해야 합니다.
+ */
+const SUMMARY_INVALIDATING_FIELDS: ReadonlyArray<keyof CurrentSession> = [
+  'last_store_id',
+  'last_store_name',
+  'selected_items',
+  'pickup_time',
+] as const;
 
 @Injectable()
 export class SessionService {
@@ -40,7 +52,7 @@ export class SessionService {
    * AI 에이전트가 의도에 따라 상태를 전이하거나 세션 필드를 수정할 때 사용합니다.
    *
    * 처리 순서:
-   *   1. Zod safeParse로 patch 구조 검증
+   *   1. 현재 상태가 READY_FOR_SUMMARY이고 정보 수집 필드(pickup_time 등)가 수정되는 경우 status를 자동으로 SEARCHING으로 롤백
    *   2. status 필드가 포함된 경우에만 상태 전이 규칙 검증
    *   3. 기존 세션에 병합 후 RedisUserSessionSchema.safeParse()로 최종 검증
    *   4. Redis 저장
@@ -51,9 +63,25 @@ export class SessionService {
       throw new NotFoundException(`Session not found for userId: ${userId}`);
     }
 
+    // READY_FOR_SUMMARY 상태에서 정보 수집 필드가 수정되면 status를 SEARCHING으로 롤백.
+    // 단, patch에 status가 명시적으로 포함된 경우(= 에이전트가 의도적으로 전이를 지정한 경우)는 롤백하지 않음.
+    const currentStatus = existing.current_session?.status;
+    if (
+      currentStatus === SessionStatus.READY_FOR_SUMMARY &&
+      patch.status === undefined &&
+      SUMMARY_INVALIDATING_FIELDS.some((field) => field in patch)
+    ) {
+      const invalidatedFields = SUMMARY_INVALIDATING_FIELDS.filter((f) => f in patch);
+      patch = { ...patch, status: SessionStatus.SEARCHING };
+      this.logger.log(
+        `[patchSession] userId=${userId} READY_FOR_SUMMARY → SEARCHING auto-rollback` +
+          ` (modified fields: [${invalidatedFields.join(', ')}])`,
+      );
+    }
+
     // status 필드가 포함된 경우에만 상태 전이 규칙 검증
     if (patch.status !== undefined) {
-      this.validateTransition(existing.current_session?.status, patch.status, userId);
+      this.validateTransition(currentStatus, patch.status, userId);
     }
 
     const updated: RedisUserSession = {
