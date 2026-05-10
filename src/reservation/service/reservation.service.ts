@@ -241,13 +241,19 @@ export class ReservationService {
 
     await this.redisHoldService.deleteHold(dto.holdToken);
 
-    // 예약 확정 성공 → COMPLETED 로 세션 상태 전이
-    await this.redisHoldService.patchCurrentSession(String(dto.userId), {
+    // 예약 확정 성공 → COMPLETED 로 세션 상태 전이 후 즉시 SEARCHING으로 초기화
+    const confirmedUserKey = String(dto.userId);
+    await this.redisHoldService.patchCurrentSession(confirmedUserKey, {
       status: SessionStatus.COMPLETED,
       hold_token: undefined,
     });
     this.logger.log(
       `[confirmHold] session updated → COMPLETED userId=${dto.userId} reservationId=${savedReservation.id}`,
+    );
+
+    await this.redisHoldService.resetCurrentSession(confirmedUserKey);
+    this.logger.log(
+      `User ${dto.userId}의 세션이 초기화되었습니다. 상태가 SEARCHING으로 리셋됩니다.`,
     );
 
     return ReservationResponseDto.from(savedReservation);
@@ -309,7 +315,7 @@ export class ReservationService {
       return CancelReservationResponseDto.from(reservation, feeMessage);
     });
 
-    // 취소 성공 → CANCELLED 로 세션 상태 전이, hold_token 즉시 삭제
+    // 취소 성공 → CANCELLED 로 세션 상태 전이 후 즉시 SEARCHING으로 초기화
     const userKey = String(dto.userId);
     await this.redisHoldService.patchCurrentSession(userKey, {
       status: SessionStatus.CANCELLED,
@@ -317,6 +323,11 @@ export class ReservationService {
     });
     this.logger.log(
       `[cancelReservation] session updated → CANCELLED userId=${dto.userId} reservationId=${id}`,
+    );
+
+    await this.redisHoldService.resetCurrentSession(userKey);
+    this.logger.log(
+      `User ${dto.userId}의 세션이 초기화되었습니다. 상태가 SEARCHING으로 리셋됩니다.`,
     );
 
     return result;

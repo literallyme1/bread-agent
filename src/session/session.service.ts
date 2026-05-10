@@ -140,6 +140,30 @@ export class SessionService {
   }
 
   /**
+   * 예약 관련 세션 데이터를 초기화하고 status를 SEARCHING으로 되돌립니다.
+   *
+   * profile(preferred_station, taste_tags)은 보존하며,
+   * current_session 내 예약 필드(last_store_id, last_store_name, selected_items,
+   * pickup_time, hold_token)만 초기값으로 덮어씁니다.
+   *
+   * COMPLETED 또는 CANCELLED 완료 직후 호출하여 다음 예약을 바로 시작할 수 있도록
+   * 세션을 준비 상태로 전환합니다.
+   *
+   * 세션이 존재하지 않으면 NotFoundException을 던집니다.
+   */
+  async resetSession(userId: string): Promise<void> {
+    const existing = await this.redisService.getSession(userId);
+    if (!existing) {
+      throw new NotFoundException(`Session not found for userId: ${userId}`);
+    }
+
+    await this.redisService.resetCurrentSession(userId);
+    this.logger.log(
+      `User ${userId}의 세션이 초기화되었습니다. 상태가 SEARCHING으로 리셋됩니다.`,
+    );
+  }
+
+  /**
    * 사용자의 Redis 세션 전체를 삭제합니다.
    * 세션이 존재하지 않으면 NotFoundException을 던집니다.
    */

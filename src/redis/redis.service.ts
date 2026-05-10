@@ -6,6 +6,7 @@ import {
   Profile,
   RedisUserSession,
   RedisUserSessionSchema,
+  SessionStatus,
 } from './session.schema';
 
 export interface HoldItem {
@@ -127,13 +128,48 @@ export class RedisHoldService {
   }
 
   /**
-   * current_session만 초기화합니다.
+   * current_session만 완전 초기화합니다 (profile은 보존).
    */
   async clearCurrentSession(userId: string): Promise<void> {
     const existing = await this.getSession(userId);
     if (!existing) return;
 
     await this.setSession(userId, { ...existing, current_session: undefined });
+  }
+
+  /**
+   * 예약 관련 세션 데이터만 초기화하고 status를 SEARCHING으로 되돌립니다.
+   *
+   * - profile(preferred_station, taste_tags)은 절대 삭제하지 않고 유지합니다.
+   * - current_session 내 예약 관련 필드만 초기값으로 덮어씁니다:
+   *     last_store_id / last_store_name → undefined
+   *     selected_items                 → [] (빈 배열)
+   *     pickup_time / hold_token       → undefined
+   *     status                         → SEARCHING
+   * - 저장 전 RedisUserSessionSchema.safeParse()로 형식 검증을 수행합니다.
+   * - 세션이 존재하지 않으면 아무것도 하지 않습니다.
+   */
+  async resetCurrentSession(userId: string): Promise<void> {
+    const existing = await this.getSession(userId);
+    if (!existing) return;
+
+    const reset: RedisUserSession = {
+      profile: existing.profile,
+      current_session: {
+        status: SessionStatus.SEARCHING,
+        selected_items: [],
+      },
+    };
+
+    const validated = RedisUserSessionSchema.safeParse(reset);
+    if (!validated.success) {
+      this.logger.error(
+        `[resetCurrentSession] schema validation failed userId=${userId}: ${validated.error.message}`,
+      );
+      return;
+    }
+
+    await this.setSession(userId, validated.data);
   }
 
   /**
