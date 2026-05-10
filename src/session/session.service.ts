@@ -1,5 +1,6 @@
 import {
   BadRequestException,
+  ConflictException,
   Injectable,
   Logger,
   NotFoundException,
@@ -7,6 +8,7 @@ import {
 import { RedisHoldService } from '../redis/redis.service';
 import {
   CurrentSession,
+  Profile,
   RedisUserSession,
   RedisUserSessionSchema,
   SessionStatus,
@@ -33,6 +35,46 @@ export class SessionService {
   private readonly logger = new Logger(SessionService.name);
 
   constructor(private readonly redisService: RedisHoldService) {}
+
+  /**
+   * 새 Redis 세션을 생성합니다.
+   *
+   * - current_session은 { status: SEARCHING, selected_items: [] } 로 초기화됩니다.
+   * - profile은 선택적으로 제공할 수 있습니다.
+   * - 이미 세션이 존재하면 409 ConflictException을 던집니다.
+   */
+  async createSession(
+    userId: string,
+    profile?: Partial<Profile>,
+  ): Promise<RedisUserSession> {
+    const existing = await this.redisService.getSession(userId);
+    if (existing) {
+      throw new ConflictException(`Session already exists for userId: ${userId}`);
+    }
+
+    const newSession: RedisUserSession = {
+      ...(profile && Object.keys(profile).length > 0
+        ? { profile: profile as Profile }
+        : {}),
+      current_session: {
+        status: SessionStatus.SEARCHING,
+        selected_items: [],
+      },
+    };
+
+    const validated = RedisUserSessionSchema.safeParse(newSession);
+    if (!validated.success) {
+      this.logger.error(
+        `[createSession] schema validation failed userId=${userId}: ${validated.error.message}`,
+      );
+      throw new BadRequestException('Session data failed schema validation');
+    }
+
+    await this.redisService.setSession(userId, validated.data);
+    this.logger.log(`[createSession] session created userId=${userId}`);
+
+    return validated.data;
+  }
 
   /**
    * 사용자의 전체 Redis 세션(Profile + CurrentSession)을 조회합니다.

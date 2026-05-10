@@ -28,7 +28,7 @@ export interface HoldData {
 export const HOLD_TTL_SECONDS = 120;
 
 /** 사용자 세션 TTL: 24시간 */
-const SESSION_TTL_SECONDS = 86_400;
+const SESSION_TTL_SECONDS = 300;
 
 @Injectable()
 export class RedisHoldService {
