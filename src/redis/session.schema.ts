@@ -111,6 +111,13 @@ export const CurrentSessionSchema = z.object({
     .optional()
     .describe('서버에서 발급한 임시 점유 토큰 (예: h-8291-abc-xyz)'),
   status: SessionStatusZodSchema.optional().describe('현재 예약 진행 상태'),
+  last_error: z
+    .string()
+    .optional()
+    .describe(
+      '마지막 작업 실패 사유. AI 에이전트가 사용자에게 실패 원인을 설명할 때 참조합니다. ' +
+        '(예: "일부 상품의 재고가 부족합니다 — 소금빵: 재고 부족 (남은 수량: 1개)")',
+    ),
 });
 export type CurrentSession = z.infer<typeof CurrentSessionSchema>;
 

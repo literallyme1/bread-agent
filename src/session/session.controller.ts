@@ -8,9 +8,12 @@ import {
   Logger,
   Param,
   Patch,
+  Post,
 } from '@nestjs/common';
 import {
   ApiBadRequestResponse,
+  ApiConflictResponse,
+  ApiCreatedResponse,
   ApiNoContentResponse,
   ApiNotFoundResponse,
   ApiOkResponse,
@@ -20,9 +23,26 @@ import {
 } from '@nestjs/swagger';
 import { createZodDto } from 'nestjs-zod';
 import { SessionService } from './session.service';
-import { CurrentSessionSchema, SelectedItemSchema, SessionStatusZodSchema } from '../redis/session.schema';
+import { CurrentSessionSchema, ProfileSchema, SelectedItemSchema, SessionStatusZodSchema } from '../redis/session.schema';
 import { ApiResponse, errorSchema } from '../common/dto/api-response.dto';
 import { z } from 'zod';
+
+// ─── Request DTO — Create ─────────────────────────────────────────────────────
+
+/**
+ * POST /v1/session/:userId 요청 바디.
+ * profile은 선택적이며, 제공하지 않으면 세션은 current_session만으로 생성됩니다.
+ */
+const CreateSessionSchema = z.object({
+  preferred_station: ProfileSchema.shape.preferred_station.optional().describe(
+    '사용자 선호 지역(역명). 예: "신중동역"',
+  ),
+  taste_tags: ProfileSchema.shape.taste_tags.optional().describe(
+    '취향 태그 배열. 예: ["달지않음", "건강빵"]',
+  ),
+});
+
+class CreateSessionDto extends createZodDto(CreateSessionSchema) {}
 
 // ─── Request DTO — Partial Update ────────────────────────────────────────────
 
@@ -149,6 +169,14 @@ const SESSION_RESPONSE_SCHEMA = {
               description: '서버에서 발급한 임시 점유 토큰',
             },
             status: SESSION_STATUS_SCHEMA,
+            last_error: {
+              type: 'string',
+              example: '일부 상품의 재고가 부족합니다 — 소금빵: 재고 부족 (남은 수량: 1개)',
+              nullable: true,
+              description:
+                '마지막 작업 실패 사유. AI 에이전트가 사용자에게 실패 원인을 설명할 때 참조합니다. ' +
+                'FAIL 상태 진입 시 서버가 자동으로 기록하며, 성공 시 삭제됩니다.',
+            },
           },
         },
       },
@@ -182,6 +210,59 @@ export class SessionController {
   private readonly logger = new Logger(SessionController.name);
 
   constructor(private readonly sessionService: SessionService) {}
+
+  /**
+   * POST /v1/session/:userId
+   */
+  @Post(':userId')
+  @HttpCode(HttpStatus.CREATED)
+  @ApiOperation({
+    operationId: 'createSession',
+    summary: '새 Redis 세션 생성',
+    description:
+      '사용자의 Redis 세션을 신규 생성합니다. ' +
+      'current_session은 `{ status: SEARCHING, selected_items: [] }` 로 초기화됩니다. ' +
+      'Body에 preferred_station / taste_tags를 전달하면 profile도 함께 저장됩니다. ' +
+      '이미 세션이 존재하면 409를 반환합니다.',
+  })
+  @ApiParam({ name: 'userId', type: String, description: '사용자 ID', example: '1' })
+  @ApiCreatedResponse({
+    description: '세션 생성 성공',
+    schema: {
+      ...SESSION_RESPONSE_SCHEMA,
+      example: {
+        data: {
+          profile: { preferred_station: '신중동역', taste_tags: ['달지않음', '건강빵'] },
+          current_session: {
+            status: 'SEARCHING',
+            selected_items: [],
+          },
+        },
+        message: 'Session created successfully',
+      },
+    },
+  })
+  @ApiConflictResponse({
+    description: '이미 세션이 존재함',
+    schema: errorSchema('Session already exists for userId: 1'),
+  })
+  @ApiBadRequestResponse({
+    description: '스키마 검증 실패',
+    schema: errorSchema('Session data failed schema validation'),
+  })
+  async createSession(
+    @Param('userId') userId: string,
+    @Body() dto: CreateSessionDto,
+  ) {
+    this.logger.log(`[createSession] userId=${userId}`);
+    const profile =
+      dto.preferred_station !== undefined || dto.taste_tags !== undefined
+        ? { preferred_station: dto.preferred_station, taste_tags: dto.taste_tags }
+        : undefined;
+    const data = await this.sessionService.createSession(userId, profile);
+    this.logger.log(`[createSession] userId=${userId} done`);
+    return ApiResponse.success(data, 'Session created successfully');
+  }
 
   /**
    * GET /v1/session/:userId

@@ -172,7 +172,7 @@
     },
     "/v1/reservations/hold": {
       "post": {
-        "description": "픽업 시각 검증 → 재고 확인 → Redis에 holdToken 저장 (TTL 2분). 재고가 있는 아이템만 HELD, 부족한 아이템은 OUT_OF_STOCK으로 반환합니다. 실제 재고 차감은 /confirm 단계에서 수행됩니다.",
+        "description": "픽업 시각 검증 → 전체 아이템 재고 확인 → All-or-Nothing 방식으로 Redis Hold 저장 (TTL 2분).\n\n**All-or-Nothing 규칙**\n- 요청한 모든 아이템의 재고가 충분할 때만 holdToken을 발급하고 Redis에 Hold를 생성합니다.\n- 단 하나라도 재고 부족이면 Redis Hold를 생성하지 않고 `success: false`와 상세 실패 목록을 반환합니다.\n\n**세션 상태 전이**\n- 성공: `PRE_HOLD_CONFIRM → WAITING_FOR_CONFIRM` (hold_token 함께 저장)\n- 실패: 현재 상태 → `FAIL` (last_error에 실패 사유 기록)\n\n실제 재고 차감은 `/confirm` 단계에서만 수행됩니다.",
         "operationId": "holdReservation",
         "parameters": [],
         "requestBody": {
@@ -187,25 +187,61 @@
         },
         "responses": {
           "200": {
-            "description": "Hold 생성 성공",
+            "description": "일부 또는 전체 재고 부족 — holdToken 미발급 (success: false)",
             "content": {
               "application/json": {
                 "schema": {
                   "example": {
                     "data": {
+                      "success": false,
+                      "holdToken": null,
+                      "items": [
+                        {
+                          "id": "101",
+                          "name": "소금빵",
+                          "requestedCount": 2,
+                          "heldCount": 2,
+                          "status": "SUCCESS"
+                        },
+                        {
+                          "id": "202",
+                          "name": "고구마빵",
+                          "requestedCount": 3,
+                          "heldCount": 0,
+                          "status": "OUT_OF_STOCK",
+                          "reason": "재고 부족 (남은 수량: 1개)"
+                        }
+                      ]
+                    },
+                    "message": "Hold created successfully"
+                  }
+                }
+              }
+            }
+          },
+          "201": {
+            "description": "전체 hold 성공 — holdToken 발급",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "example": {
+                    "data": {
+                      "success": true,
                       "holdToken": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
                       "items": [
                         {
-                          "breadName": "소금빵",
-                          "requestedQty": 2,
-                          "heldQty": 2,
-                          "status": "HELD"
+                          "id": "101",
+                          "name": "소금빵",
+                          "requestedCount": 2,
+                          "heldCount": 2,
+                          "status": "SUCCESS"
                         },
                         {
-                          "breadName": "고구마빵",
-                          "requestedQty": 3,
-                          "heldQty": 0,
-                          "status": "OUT_OF_STOCK"
+                          "id": "202",
+                          "name": "크림빵",
+                          "requestedCount": 1,
+                          "heldCount": 1,
+                          "status": "SUCCESS"
                         }
                       ]
                     },
@@ -256,7 +292,7 @@
             }
           }
         },
-        "summary": "재고 임시 hold 생성",
+        "summary": "재고 임시 hold 생성 (All-or-Nothing)",
         "tags": [
           "Reservations"
         ]
@@ -691,6 +727,215 @@
       }
     },
     "/v1/session/{userId}": {
+      "post": {
+        "description": "사용자의 Redis 세션을 신규 생성합니다. current_session은 `{ status: SEARCHING, selected_items: [] }` 로 초기화됩니다. Body에 preferred_station / taste_tags를 전달하면 profile도 함께 저장됩니다. 이미 세션이 존재하면 409를 반환합니다.",
+        "operationId": "createSession",
+        "parameters": [
+          {
+            "name": "userId",
+            "required": true,
+            "in": "path",
+            "description": "사용자 ID",
+            "schema": {
+              "example": "1",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateSessionDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "세션 생성 성공",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "data": {
+                      "type": "object",
+                      "properties": {
+                        "profile": {
+                          "type": "object",
+                          "nullable": true,
+                          "description": "사용자 선호 프로필",
+                          "properties": {
+                            "preferred_station": {
+                              "type": "string",
+                              "example": "신중동역",
+                              "description": "선호 지역(역명). 특정 역명을 강제하지 않으며 동적으로 관리됩니다."
+                            },
+                            "taste_tags": {
+                              "type": "array",
+                              "items": {
+                                "type": "string"
+                              },
+                              "example": [
+                                "달지않음",
+                                "건강빵"
+                              ],
+                              "description": "취향 태그 배열"
+                            }
+                          }
+                        },
+                        "current_session": {
+                          "type": "object",
+                          "nullable": true,
+                          "description": "예약 진행을 위한 실시간 세션 데이터",
+                          "properties": {
+                            "last_store_id": {
+                              "type": "integer",
+                              "example": 12,
+                              "nullable": true,
+                              "description": "마지막으로 선택한 매장 ID (매장 선택 시점부터 저장)"
+                            },
+                            "last_store_name": {
+                              "type": "string",
+                              "example": "하레하레 강남",
+                              "nullable": true,
+                              "description": "마지막으로 선택한 매장 이름 (매장 선택 시점부터 저장)"
+                            },
+                            "selected_items": {
+                              "type": "array",
+                              "nullable": true,
+                              "description": "선택한 아이템 목록",
+                              "items": {
+                                "type": "object",
+                                "properties": {
+                                  "id": {
+                                    "type": "integer",
+                                    "example": 101,
+                                    "description": "빵/메뉴 ID"
+                                  },
+                                  "name": {
+                                    "type": "string",
+                                    "example": "소금빵",
+                                    "description": "빵/메뉴 이름"
+                                  },
+                                  "count": {
+                                    "type": "integer",
+                                    "example": 2,
+                                    "description": "수량 (1 이상)"
+                                  }
+                                }
+                              }
+                            },
+                            "pickup_time": {
+                              "type": "string",
+                              "example": "2026-05-09T20:00:00",
+                              "nullable": true,
+                              "description": "픽업 예정 시각 (ISO 8601)"
+                            },
+                            "hold_token": {
+                              "type": "string",
+                              "example": "h-8291-abc-xyz",
+                              "nullable": true,
+                              "description": "서버에서 발급한 임시 점유 토큰"
+                            },
+                            "status": {
+                              "type": "string",
+                              "enum": [
+                                "SEARCHING",
+                                "READY_FOR_SUMMARY",
+                                "PRE_HOLD_CONFIRM",
+                                "WAITING_FOR_CONFIRM",
+                                "WAITING_FOR_CANCELLING_CONFIRM",
+                                "COMPLETED",
+                                "CANCELLED",
+                                "FAIL",
+                                "EXPIRED"
+                              ],
+                              "example": "WAITING_FOR_CONFIRM",
+                              "description": "Redis 세션 예약 상태 (DB ReservationStatus와 분리된 세션 전용 상태값):\n  SEARCHING - 예약 정보를 수집 중인 초기 탐색 상태\n  READY_FOR_SUMMARY - 모든 정보 수집 완료 후 최종 요약을 보여주고 사용자 승인을 기다리는 상태\n  PRE_HOLD_CONFIRM - 요약 승인 후 실제 hold 점유를 시도하기 직전의 상태\n  WAITING_FOR_CONFIRM - holdReservation 성공 후 2분 내 최종 확정 대기\n  WAITING_FOR_CANCELLING_CONFIRM - 취소 요청 후 수수료 고지, 사용자 최종 동의 대기\n  COMPLETED - 예약이 성공적으로 확정된 상태\n  CANCELLED - 예약 취소가 완료된 상태\n  FAIL - 재고 부족 또는 시스템 오류로 중단된 상태\n  EXPIRED - Hold TTL 만료로 인해 예약을 진행할 수 없는 상태"
+                            },
+                            "last_error": {
+                              "type": "string",
+                              "example": "일부 상품의 재고가 부족합니다 — 소금빵: 재고 부족 (남은 수량: 1개)",
+                              "nullable": true,
+                              "description": "마지막 작업 실패 사유. AI 에이전트가 사용자에게 실패 원인을 설명할 때 참조합니다. FAIL 상태 진입 시 서버가 자동으로 기록하며, 성공 시 삭제됩니다."
+                            }
+                          }
+                        }
+                      }
+                    },
+                    "message": {
+                      "type": "string",
+                      "example": "Session fetched successfully"
+                    }
+                  },
+                  "example": {
+                    "data": {
+                      "profile": {
+                        "preferred_station": "신중동역",
+                        "taste_tags": [
+                          "달지않음",
+                          "건강빵"
+                        ]
+                      },
+                      "current_session": {
+                        "status": "SEARCHING",
+                        "selected_items": []
+                      }
+                    },
+                    "message": "Session created successfully"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "스키마 검증 실패",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "data": {
+                      "type": "object",
+                      "nullable": true,
+                      "example": null
+                    },
+                    "message": {
+                      "type": "string",
+                      "example": "Session data failed schema validation"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "이미 세션이 존재함",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "data": {
+                      "type": "object",
+                      "nullable": true,
+                      "example": null
+                    },
+                    "message": {
+                      "type": "string",
+                      "example": "Session already exists for userId: 1"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "summary": "새 Redis 세션 생성",
+        "tags": [
+          "Session"
+        ]
+      },
       "get": {
         "description": "특정 사용자의 전체 Redis 세션 데이터(Profile + CurrentSession)를 반환합니다. 세션이 존재하지 않으면 404를 반환합니다.",
         "operationId": "getSession",
@@ -797,6 +1042,7 @@
                               "type": "string",
                               "enum": [
                                 "SEARCHING",
+                                "READY_FOR_SUMMARY",
                                 "PRE_HOLD_CONFIRM",
                                 "WAITING_FOR_CONFIRM",
                                 "WAITING_FOR_CANCELLING_CONFIRM",
@@ -806,7 +1052,13 @@
                                 "EXPIRED"
                               ],
                               "example": "WAITING_FOR_CONFIRM",
-                              "description": "Redis 세션 예약 상태 (DB ReservationStatus와 분리된 세션 전용 상태값):\n  SEARCHING - 예약 정보를 수집 중인 초기 탐색 상태\n  PRE_HOLD_CONFIRM - 모든 정보가 수집되어 사용자에게 최종 확인을 구하는 상태\n  WAITING_FOR_CONFIRM - holdReservation 성공 후 2분 내 최종 확정 대기\n  WAITING_FOR_CANCELLING_CONFIRM - 취소 요청 후 수수료 고지, 사용자 최종 동의 대기\n  COMPLETED - 예약이 성공적으로 확정된 상태\n  CANCELLED - 예약 취소가 완료된 상태\n  FAIL - 재고 부족 또는 시스템 오류로 중단된 상태\n  EXPIRED - Hold TTL 만료로 인해 예약을 진행할 수 없는 상태"
+                              "description": "Redis 세션 예약 상태 (DB ReservationStatus와 분리된 세션 전용 상태값):\n  SEARCHING - 예약 정보를 수집 중인 초기 탐색 상태\n  READY_FOR_SUMMARY - 모든 정보 수집 완료 후 최종 요약을 보여주고 사용자 승인을 기다리는 상태\n  PRE_HOLD_CONFIRM - 요약 승인 후 실제 hold 점유를 시도하기 직전의 상태\n  WAITING_FOR_CONFIRM - holdReservation 성공 후 2분 내 최종 확정 대기\n  WAITING_FOR_CANCELLING_CONFIRM - 취소 요청 후 수수료 고지, 사용자 최종 동의 대기\n  COMPLETED - 예약이 성공적으로 확정된 상태\n  CANCELLED - 예약 취소가 완료된 상태\n  FAIL - 재고 부족 또는 시스템 오류로 중단된 상태\n  EXPIRED - Hold TTL 만료로 인해 예약을 진행할 수 없는 상태"
+                            },
+                            "last_error": {
+                              "type": "string",
+                              "example": "일부 상품의 재고가 부족합니다 — 소금빵: 재고 부족 (남은 수량: 1개)",
+                              "nullable": true,
+                              "description": "마지막 작업 실패 사유. AI 에이전트가 사용자에게 실패 원인을 설명할 때 참조합니다. FAIL 상태 진입 시 서버가 자동으로 기록하며, 성공 시 삭제됩니다."
                             }
                           }
                         }
@@ -989,6 +1241,7 @@
                               "type": "string",
                               "enum": [
                                 "SEARCHING",
+                                "READY_FOR_SUMMARY",
                                 "PRE_HOLD_CONFIRM",
                                 "WAITING_FOR_CONFIRM",
                                 "WAITING_FOR_CANCELLING_CONFIRM",
@@ -998,7 +1251,13 @@
                                 "EXPIRED"
                               ],
                               "example": "WAITING_FOR_CONFIRM",
-                              "description": "Redis 세션 예약 상태 (DB ReservationStatus와 분리된 세션 전용 상태값):\n  SEARCHING - 예약 정보를 수집 중인 초기 탐색 상태\n  PRE_HOLD_CONFIRM - 모든 정보가 수집되어 사용자에게 최종 확인을 구하는 상태\n  WAITING_FOR_CONFIRM - holdReservation 성공 후 2분 내 최종 확정 대기\n  WAITING_FOR_CANCELLING_CONFIRM - 취소 요청 후 수수료 고지, 사용자 최종 동의 대기\n  COMPLETED - 예약이 성공적으로 확정된 상태\n  CANCELLED - 예약 취소가 완료된 상태\n  FAIL - 재고 부족 또는 시스템 오류로 중단된 상태\n  EXPIRED - Hold TTL 만료로 인해 예약을 진행할 수 없는 상태"
+                              "description": "Redis 세션 예약 상태 (DB ReservationStatus와 분리된 세션 전용 상태값):\n  SEARCHING - 예약 정보를 수집 중인 초기 탐색 상태\n  READY_FOR_SUMMARY - 모든 정보 수집 완료 후 최종 요약을 보여주고 사용자 승인을 기다리는 상태\n  PRE_HOLD_CONFIRM - 요약 승인 후 실제 hold 점유를 시도하기 직전의 상태\n  WAITING_FOR_CONFIRM - holdReservation 성공 후 2분 내 최종 확정 대기\n  WAITING_FOR_CANCELLING_CONFIRM - 취소 요청 후 수수료 고지, 사용자 최종 동의 대기\n  COMPLETED - 예약이 성공적으로 확정된 상태\n  CANCELLED - 예약 취소가 완료된 상태\n  FAIL - 재고 부족 또는 시스템 오류로 중단된 상태\n  EXPIRED - Hold TTL 만료로 인해 예약을 진행할 수 없는 상태"
+                            },
+                            "last_error": {
+                              "type": "string",
+                              "example": "일부 상품의 재고가 부족합니다 — 소금빵: 재고 부족 (남은 수량: 1개)",
+                              "nullable": true,
+                              "description": "마지막 작업 실패 사유. AI 에이전트가 사용자에게 실패 원인을 설명할 때 참조합니다. FAIL 상태 진입 시 서버가 자동으로 기록하며, 성공 시 삭제됩니다."
                             }
                           }
                         }
@@ -1264,6 +1523,22 @@
           "userId"
         ]
       },
+      "CreateSessionDto": {
+        "type": "object",
+        "properties": {
+          "preferred_station": {
+            "description": "사용자 선호 지역(역명). 예: \"신중동역\"",
+            "type": "string"
+          },
+          "taste_tags": {
+            "description": "취향 태그 배열. 예: [\"달지않음\", \"건강빵\"]",
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
       "PatchSessionDto": {
         "type": "object",
         "properties": {
@@ -1316,10 +1591,11 @@
             "type": "string"
           },
           "status": {
-            "description": "변경할 예약 상태:\n  SEARCHING                      - 예약 정보를 수집 중인 초기 탐색 상태\n  PRE_HOLD_CONFIRM               - 모든 정보가 수집되어 사용자에게 최종 확인을 구하는 상태\n  WAITING_FOR_CONFIRM            - holdReservation 성공(전 아이템 hold) 후 2분 내 확정 대기\n  WAITING_FOR_CANCELLING_CONFIRM - 취소 요청 후 수수료 고지, 사용자 최종 동의 대기\n  COMPLETED                      - 예약이 성공적으로 확정된 상태\n  CANCELLED                      - 예약 취소가 완료된 상태\n  FAIL                           - 재고 부족 또는 시스템 오류로 중단된 상태\n  EXPIRED                        - Hold TTL 만료로 예약 진행 불가",
+            "description": "변경할 예약 상태:\n  SEARCHING                      - 예약 정보를 수집 중인 초기 탐색 상태\n  READY_FOR_SUMMARY              - 모든 정보 수집 완료 후 최종 요약을 보여주고 사용자 승인을 기다리는 상태\n  PRE_HOLD_CONFIRM               - 요약 승인 후 실제 hold 점유를 시도하기 직전의 상태\n  WAITING_FOR_CONFIRM            - holdReservation 성공(전 아이템 hold) 후 2분 내 확정 대기\n  WAITING_FOR_CANCELLING_CONFIRM - 취소 요청 후 수수료 고지, 사용자 최종 동의 대기\n  COMPLETED                      - 예약이 성공적으로 확정된 상태\n  CANCELLED                      - 예약 취소가 완료된 상태\n  FAIL                           - 재고 부족 또는 시스템 오류로 중단된 상태\n  EXPIRED                        - Hold TTL 만료로 예약 진행 불가",
             "type": "string",
             "enum": [
               "SEARCHING",
+              "READY_FOR_SUMMARY",
               "PRE_HOLD_CONFIRM",
               "WAITING_FOR_CONFIRM",
               "WAITING_FOR_CANCELLING_CONFIRM",
