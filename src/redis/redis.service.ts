@@ -111,6 +111,9 @@ export class RedisHoldService {
   /**
    * current_session 필드를 부분 업데이트합니다.
    * 기존 current_session 위에 patch를 병합합니다.
+   *
+   * 세션이 존재하지 않아 새로 생성되는 경우 status의 기본값은 SEARCHING입니다.
+   * 기존 세션에 status가 이미 존재하면 해당 값이 유지되며, patch에 status가 포함된 경우에만 덮어씁니다.
    */
   async patchCurrentSession(
     userId: string,
@@ -120,6 +123,7 @@ export class RedisHoldService {
     const merged: RedisUserSession = {
       ...existing,
       current_session: {
+        status: SessionStatus.SEARCHING,   // 신규 세션 기본값; 아래 스프레드로 덮어쓰임
         ...existing.current_session,
         ...patch,
       },
