@@ -2,6 +2,7 @@ import { BaseToolset, FunctionTool } from '@google/adk';
 import type { BaseTool, ReadonlyContext } from '@google/adk';
 import type { Schema } from '@google/genai';
 import { Type } from '@google/genai';
+import { chatContextStorage } from './chat-context';
 
 // ─── OpenAPI 3.x document interfaces ────────────────────────────────────────
 
@@ -233,9 +234,16 @@ export class OpenApiToolset extends BaseToolset {
         }
 
         try {
+          // AsyncLocalStorage에서 신뢰할 수 있는 userId를 읽어 헤더에 주입.
+          // chat() 스코프 외부에서 호출되면 undefined → 헤더 미포함.
+          const chatCtx = chatContextStorage.getStore();
+          const requestHeaders: Record<string, string> = {};
+          if (body) requestHeaders['Content-Type'] = 'application/json';
+          if (chatCtx?.userId) requestHeaders['X-Chat-User-Id'] = chatCtx.userId;
+
           const response = await fetch(url, {
             method: capturedMethod,
-            headers: body ? { 'Content-Type': 'application/json' } : {},
+            headers: requestHeaders,
             body,
           });
 

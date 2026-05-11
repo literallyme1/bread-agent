@@ -3,17 +3,16 @@ import {
   Controller,
   Delete,
   Get,
+  Headers,
   HttpCode,
   HttpStatus,
   Logger,
   Param,
   Patch,
-  Post,
 } from '@nestjs/common';
 import {
   ApiBadRequestResponse,
-  ApiConflictResponse,
-  ApiCreatedResponse,
+  ApiHeader,
   ApiNoContentResponse,
   ApiNotFoundResponse,
   ApiOkResponse,
@@ -22,39 +21,33 @@ import {
   ApiTags,
 } from '@nestjs/swagger';
 import { createZodDto } from 'nestjs-zod';
-import { SessionService } from './session.service';
+import { SessionService, SessionPatchPayload } from './session.service';
 import { CurrentSessionSchema, ProfileSchema, SelectedItemSchema, SessionStatusZodSchema } from '../redis/session.schema';
 import { ApiResponse, errorSchema } from '../common/dto/api-response.dto';
 import { z } from 'zod';
 
-// ─── Request DTO — Create ─────────────────────────────────────────────────────
-
-/**
- * POST /v1/session/:userId 요청 바디.
- * profile은 선택적이며, 제공하지 않으면 세션은 current_session만으로 생성됩니다.
- */
-const CreateSessionSchema = z.object({
-  preferred_station: ProfileSchema.shape.preferred_station.optional().describe(
-    '사용자 선호 지역(역명). 예: "신중동역"',
-  ),
-  taste_tags: ProfileSchema.shape.taste_tags.optional().describe(
-    '취향 태그 배열. 예: ["달지않음", "건강빵"]',
-  ),
-});
-
-class CreateSessionDto extends createZodDto(CreateSessionSchema) {}
-
-// ─── Request DTO — Partial Update ────────────────────────────────────────────
+// ─── Request DTO — Partial Update / Upsert ───────────────────────────────────
 
 /**
  * PATCH /v1/session/:userId 요청 바디.
- * CurrentSession의 모든 필드가 optional이므로, 전달된 필드만 기존 세션에 병합됩니다.
+ *
+ * profile 필드(preferred_station, taste_tags)와 current_session 필드를 하나의 요청으로 함께 수정할 수 있습니다.
+ * 전달된 필드만 기존 세션에 병합되며, 나머지 필드는 그대로 유지됩니다.
+ * 세션이 없으면 기본값(SEARCHING)으로 자동 생성 후 병합합니다(Upsert).
  */
 const PatchSessionSchema = z.object({
+  // ── profile 필드 ────────────────────────────────────────────────────────────
+  preferred_station: ProfileSchema.shape.preferred_station.optional().describe(
+    '사용자 선호 지역(역명). profile.preferred_station에 저장됩니다. (예: "신중동역")',
+  ),
+  taste_tags: ProfileSchema.shape.taste_tags.optional().describe(
+    '취향 태그 배열. profile.taste_tags에 저장됩니다. (예: ["달지않음", "건강빵"])',
+  ),
+  // ── current_session 필드 ────────────────────────────────────────────────────
   last_store_id: CurrentSessionSchema.shape.last_store_id,
   last_store_name: CurrentSessionSchema.shape.last_store_name,
   selected_items: z.array(SelectedItemSchema).optional().describe(
-    '선택한 아이템 목록 ({ id, name, count } 배열)',
+    '선택한 아이템 목록. 각 요소: { id: number, name: string, count: number }',
   ),
   pickup_time: CurrentSessionSchema.shape.pickup_time,
   hold_token: CurrentSessionSchema.shape.hold_token,
@@ -212,59 +205,6 @@ export class SessionController {
   constructor(private readonly sessionService: SessionService) {}
 
   /**
-   * POST /v1/session/:userId
-   */
-  @Post(':userId')
-  @HttpCode(HttpStatus.CREATED)
-  @ApiOperation({
-    operationId: 'createSession',
-    summary: '새 Redis 세션 생성',
-    description:
-      '사용자의 Redis 세션을 신규 생성합니다. ' +
-      'current_session은 `{ status: SEARCHING, selected_items: [] }` 로 초기화됩니다. ' +
-      'Body에 preferred_station / taste_tags를 전달하면 profile도 함께 저장됩니다. ' +
-      '이미 세션이 존재하면 409를 반환합니다.',
-  })
-  @ApiParam({ name: 'userId', type: String, description: '사용자 ID', example: '1' })
-  @ApiCreatedResponse({
-    description: '세션 생성 성공',
-    schema: {
-      ...SESSION_RESPONSE_SCHEMA,
-      example: {
-        data: {
-          profile: { preferred_station: '신중동역', taste_tags: ['달지않음', '건강빵'] },
-          current_session: {
-            status: 'SEARCHING',
-            selected_items: [],
-          },
-        },
-        message: 'Session created successfully',
-      },
-    },
-  })
-  @ApiConflictResponse({
-    description: '이미 세션이 존재함',
-    schema: errorSchema('Session already exists for userId: 1'),
-  })
-  @ApiBadRequestResponse({
-    description: '스키마 검증 실패',
-    schema: errorSchema('Session data failed schema validation'),
-  })
-  async createSession(
-    @Param('userId') userId: string,
-    @Body() dto: CreateSessionDto,
-  ) {
-    this.logger.log(`[createSession] userId=${userId}`);
-    const profile =
-      dto.preferred_station !== undefined || dto.taste_tags !== undefined
-        ? { preferred_station: dto.preferred_station, taste_tags: dto.taste_tags }
-        : undefined;
-    const data = await this.sessionService.createSession(userId, profile);
-    this.logger.log(`[createSession] userId=${userId} done`);
-    return ApiResponse.success(data, 'Session created successfully');
-  }
-
-  /**
    * GET /v1/session/:userId
    */
   @Get(':userId')
@@ -296,21 +236,29 @@ export class SessionController {
   @Patch(':userId')
   @ApiOperation({
     operationId: 'patchSession',
-    summary: 'current_session Partial Update',
+    summary: 'current_session Upsert (생성 또는 업데이트)',
     description:
       'Body에 포함된 필드만 기존 current_session에 병합합니다(Partial Update). ' +
-      '포함되지 않은 필드는 기존 값을 그대로 유지합니다. ' +
+      '세션이 존재하지 않으면 기본 스키마(SEARCHING)로 자동 생성 후 병합합니다(Upsert). ' +
       'AI 에이전트가 의도에 따라 상태를 전이하거나 특정 세션 필드를 변경할 때 사용합니다. ' +
-      '저장 전 RedisUserSessionSchema.safeParse()로 런타임 검증을 수행합니다.',
+      'X-Chat-User-Id 헤더가 존재하면 path의 userId 대신 해당 값을 사용합니다(AI 호출 보안).',
   })
   @ApiParam({ name: 'userId', type: String, description: '사용자 ID', example: '1' })
+  @ApiHeader({
+    name: 'X-Chat-User-Id',
+    description:
+      'AI 도구 호출 시 서버가 자동 주입하는 신뢰 userId. ' +
+      '이 헤더가 존재하면 path의 userId를 덮어씁니다(환각/위변조 차단).',
+    required: false,
+    example: '1',
+  })
   @ApiOkResponse({
-    description: 'Partial Update 성공 — 병합된 세션 전체 반환',
+    description: 'Upsert 성공 — 병합된 세션 전체 반환',
     schema: {
       ...SESSION_RESPONSE_SCHEMA,
       example: {
         data: {
-          profile: { preferred_station: '신중동역', taste_tags: ['달지않음'] },
+          profile: { preferred_station: '신중동역', taste_tags: ['달지않음', '건강빵'] },
           current_session: {
             last_store_id: 12,
             last_store_name: '하레하레 강남',
@@ -318,15 +266,12 @@ export class SessionController {
             pickup_time: '2026-05-09T20:00:00',
             hold_token: 'h-8291-abc-xyz',
             status: 'PRE_HOLD_CONFIRM',
+            last_error: null,
           },
         },
         message: 'Session patched successfully',
       },
     },
-  })
-  @ApiNotFoundResponse({
-    description: '세션 없음',
-    schema: errorSchema('Session not found for userId: 1'),
   })
   @ApiBadRequestResponse({
     description: '허용되지 않는 필드 값 또는 스키마 검증 실패',
@@ -335,10 +280,16 @@ export class SessionController {
   async patchSession(
     @Param('userId') userId: string,
     @Body() dto: PatchSessionDto,
+    @Headers('x-chat-user-id') trustedUserId?: string,
   ) {
-    this.logger.log(`[patchSession] userId=${userId} fields=[${Object.keys(dto).join(', ')}]`);
-    const data = await this.sessionService.patchSession(userId, dto);
-    this.logger.log(`[patchSession] userId=${userId} done`);
+    // AI 도구 호출 시 X-Chat-User-Id 헤더가 주입됨 → 신뢰할 수 있는 userId 사용
+    const effectiveUserId = trustedUserId ?? userId;
+    this.logger.log(
+      `[patchSession] effectiveUserId=${effectiveUserId}` +
+        `${trustedUserId ? ' (via X-Chat-User-Id)' : ''} fields=[${Object.keys(dto).join(', ')}]`,
+    );
+    const data = await this.sessionService.patchSession(effectiveUserId, dto as SessionPatchPayload);
+    this.logger.log(`[patchSession] effectiveUserId=${effectiveUserId} done`);
     return ApiResponse.success(data, 'Session patched successfully');
   }
 
