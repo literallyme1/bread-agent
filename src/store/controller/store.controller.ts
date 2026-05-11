@@ -28,7 +28,10 @@ export class StoreController {
       '역 이름 기준으로 매장·재고·태그를 한 번에 조회합니다. ' +
       'storeName / breadName은 pg_trgm 유사 검색이 적용되어 오타를 보완합니다. ' +
       'preference는 exact match이며 여러 개 전달 시 OR 조건으로 동작합니다 ' +
-      '(e.g. ?preference=짭짤&preference=바삭).',
+      '(e.g. ?preference=짭짤&preference=바삭).\n\n' +
+      '**Side-Effect**: `userId`와 `station`이 함께 전달되면, 검색한 역 이름을 해당 사용자의 ' +
+      'Redis 세션 `profile.preferred_station`에 자동으로 저장합니다. ' +
+      'AI 에이전트는 매장 검색 시 항상 `userId`를 함께 전달해 선호 지역을 동기화하세요.',
   })
   @ApiOkResponse({
     description: '매장 목록 반환',

@@ -13,6 +13,7 @@ import { InventoryModule } from './inventory/inventory.module';
 import { ReservationModule } from './reservation/reservation.module';
 import { RedisModule } from './redis/redis.module';
 import { AiModule } from './ai/ai.module';
+import { SessionModule } from './session/session.module';
 
 @Module({
   imports: [
@@ -41,6 +42,7 @@ import { AiModule } from './ai/ai.module';
     StoreModule,
     InventoryModule,
     ReservationModule,
+    SessionModule,
     AiModule,
   ],
 })

@@ -1,6 +1,6 @@
 import { Injectable } from '@nestjs/common';
 import { DataSource, EntityManager } from 'typeorm';
-import { Reservation } from '../entity/reservation.entity';
+import { Reservation, ReservationStatus } from '../entity/reservation.entity';
 import { ReservationItem } from '../entity/reservation-item.entity';
 import { User } from '../../user/entity/user.entity';
 
@@ -39,5 +39,19 @@ export class ReservationRepository {
   async findUserById(userId: number, manager?: EntityManager): Promise<User | null> {
     const repo = manager ? manager.getRepository(User) : this.dataSource.getRepository(User);
     return repo.findOne({ where: { id: userId } });
+  }
+
+  /**
+   * 사용자 ID + 상태로 예약 목록 조회 (최신순, items 포함)
+   */
+  async findByUserIdAndStatus(
+    userId: number,
+    status: ReservationStatus,
+  ): Promise<Reservation[]> {
+    return this.dataSource.getRepository(Reservation).find({
+      where: { userId, status },
+      relations: ['items'],
+      order: { createdAt: 'DESC' },
+    });
   }
 }
