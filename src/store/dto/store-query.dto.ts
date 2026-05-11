@@ -5,6 +5,13 @@ import { Station } from '../../common/enums/station.enum';
 
 //규칙 스키마 
 const StoreQuerySchema = z.object({
+  userId: z
+    .string()
+    .optional()
+    .describe(
+      '사용자 ID. 제공 시 검색한 역(station)을 해당 사용자의 Redis 세션 preferred_station에 자동 저장합니다.',
+    ),
+
   station: z
     .enum(Object.values(Station) as [string, ...string[]]).optional()
     .describe('지하철역 이름 (필수)'),

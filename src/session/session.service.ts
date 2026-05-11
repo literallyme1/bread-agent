@@ -1,6 +1,5 @@
 import {
   BadRequestException,
-  ConflictException,
   Injectable,
   Logger,
   NotFoundException,
@@ -14,6 +13,19 @@ import {
   SessionStatus,
   SessionStatusType,
 } from '../redis/session.schema';
+
+/**
+ * patchSession이 수신하는 통합 패치 페이로드.
+ *
+ * - profile 필드(preferred_station, taste_tags): 최상위로 전달되며 서비스 내부에서 profile 객체에 병합됩니다.
+ * - current_session 필드: 나머지 모든 CurrentSession 필드.
+ *
+ * AI가 단일 patchSession 호출로 profile과 current_session을 동시에 수정할 수 있습니다.
+ */
+export type SessionPatchPayload = Partial<CurrentSession> & {
+  preferred_station?: Profile['preferred_station'];
+  taste_tags?: Profile['taste_tags'];
+};
 import {
   getAllowedNextStatuses,
   isValidTransition,
@@ -37,46 +49,6 @@ export class SessionService {
   constructor(private readonly redisService: RedisHoldService) {}
 
   /**
-   * 새 Redis 세션을 생성합니다.
-   *
-   * - current_session은 { status: SEARCHING, selected_items: [] } 로 초기화됩니다.
-   * - profile은 선택적으로 제공할 수 있습니다.
-   * - 이미 세션이 존재하면 409 ConflictException을 던집니다.
-   */
-  async createSession(
-    userId: string,
-    profile?: Partial<Profile>,
-  ): Promise<RedisUserSession> {
-    const existing = await this.redisService.getSession(userId);
-    if (existing) {
-      throw new ConflictException(`Session already exists for userId: ${userId}`);
-    }
-
-    const newSession: RedisUserSession = {
-      ...(profile && Object.keys(profile).length > 0
-        ? { profile: profile as Profile }
-        : {}),
-      current_session: {
-        status: SessionStatus.SEARCHING,
-        selected_items: [],
-      },
-    };
-
-    const validated = RedisUserSessionSchema.safeParse(newSession);
-    if (!validated.success) {
-      this.logger.error(
-        `[createSession] schema validation failed userId=${userId}: ${validated.error.message}`,
-      );
-      throw new BadRequestException('Session data failed schema validation');
-    }
-
-    await this.redisService.setSession(userId, validated.data);
-    this.logger.log(`[createSession] session created userId=${userId}`);
-
-    return validated.data;
-  }
-
-  /**
    * 사용자의 전체 Redis 세션(Profile + CurrentSession)을 조회합니다.
    * 세션이 존재하지 않으면 NotFoundException을 던집니다.
    */
@@ -89,25 +61,52 @@ export class SessionService {
   }
 
   /**
-   * current_session을 Partial Update(PATCH)합니다.
-   * Body에 포함된 필드만 기존 세션에 병합하며, 나머지 필드는 그대로 유지됩니다.
-   * AI 에이전트가 의도에 따라 상태를 전이하거나 세션 필드를 수정할 때 사용합니다.
+   * 세션을 Upsert 방식으로 업데이트합니다.
+   *
+   * - profile 필드(preferred_station, taste_tags)와 current_session 필드를 단일 호출로 함께 수정할 수 있습니다.
+   * - 세션이 없으면 기본 스키마({ status: SEARCHING, selected_items: [] })로 먼저 생성한 뒤 병합합니다.
    *
    * 처리 순서:
-   *   1. 현재 상태가 READY_FOR_SUMMARY이고 정보 수집 필드(pickup_time 등)가 수정되는 경우 status를 자동으로 SEARCHING으로 롤백
-   *   2. status 필드가 포함된 경우에만 상태 전이 규칙 검증
-   *   3. 기존 세션에 병합 후 RedisUserSessionSchema.safeParse()로 최종 검증
-   *   4. Redis 저장
+   *   1. Upsert: 세션 조회 → 없으면 기본 세션으로 초기화
+   *   2. profile 필드(preferred_station, taste_tags) 분리 → profile 객체에 병합
+   *   3. 현재 상태가 READY_FOR_SUMMARY이고 정보 수집 필드가 수정되는 경우 status를 SEARCHING으로 자동 롤백
+   *   4. status 필드가 포함된 경우에만 상태 전이 규칙 검증 (신규 세션이면 모든 상태 허용)
+   *   5. 기존 세션에 병합 후 RedisUserSessionSchema.safeParse()로 최종 검증
+   *   6. Redis 저장
    */
-  async patchSession(userId: string, patch: Partial<CurrentSession>): Promise<RedisUserSession> {
-    const existing = await this.redisService.getSession(userId);
-    if (!existing) {
-      throw new NotFoundException(`Session not found for userId: ${userId}`);
+  async patchSession(userId: string, payload: SessionPatchPayload): Promise<RedisUserSession> {
+    // Upsert: rawExisting이 null이면 신규 세션으로 간주.
+    // currentStatus는 rawExisting에서 추출하여, 신규 세션(null)의 경우 undefined로 유지 →
+    // validateTransition이 초기 세션으로 인식하여 모든 상태 전이를 허용합니다.
+    const rawExisting = await this.redisService.getSession(userId);
+    const existing: RedisUserSession = rawExisting ?? {
+      current_session: {
+        status: SessionStatus.SEARCHING,
+        selected_items: [],
+      },
+    };
+
+    if (!rawExisting) {
+      this.logger.log(`[patchSession] userId=${userId} session not found — auto-creating with SEARCHING defaults`);
     }
+
+    // profile 필드와 current_session 필드 분리
+    const { preferred_station, taste_tags, ...currentSessionPatch } = payload;
+
+    // profile 병합 (제공된 필드만 덮어씀)
+    const updatedProfile: RedisUserSession['profile'] =
+      preferred_station !== undefined || taste_tags !== undefined
+        ? ({
+            ...existing.profile,
+            ...(preferred_station !== undefined ? { preferred_station } : {}),
+            ...(taste_tags !== undefined        ? { taste_tags }        : {}),
+          } as Profile)
+        : existing.profile;
 
     // READY_FOR_SUMMARY 상태에서 정보 수집 필드가 수정되면 status를 SEARCHING으로 롤백.
     // 단, patch에 status가 명시적으로 포함된 경우(= 에이전트가 의도적으로 전이를 지정한 경우)는 롤백하지 않음.
-    const currentStatus = existing.current_session?.status;
+    const currentStatus = rawExisting?.current_session?.status;
+    let patch = currentSessionPatch as Partial<CurrentSession>;
     if (
       currentStatus === SessionStatus.READY_FOR_SUMMARY &&
       patch.status === undefined &&
@@ -127,7 +126,7 @@ export class SessionService {
     }
 
     const updated: RedisUserSession = {
-      ...existing,
+      profile: updatedProfile,
       current_session: {
         ...existing.current_session,
         ...patch,
@@ -144,7 +143,7 @@ export class SessionService {
 
     await this.redisService.setSession(userId, validated.data);
     this.logger.log(
-      `[patchSession] userId=${userId} patched fields=[${Object.keys(patch).join(', ')}]`,
+      `[patchSession] userId=${userId} patched fields=[${Object.keys(payload).join(', ')}]`,
     );
 
     return validated.data;
