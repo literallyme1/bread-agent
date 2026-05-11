@@ -1,10 +1,11 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, Logger } from '@nestjs/common';
 import { DataSource } from 'typeorm';
 import { randomUUID } from 'crypto';
 import { ReservationRepository } from '../repository/reservation.repository';
 import { InventoryRepository } from '../../inventory/repository/inventory.repository';
 import { StoreRepository } from '../../store/repository/store.repository';
 import { RedisHoldService, HoldData, HOLD_TTL_SECONDS } from '../../redis/redis.service';
+import { SessionStatus } from '../../redis/session.schema';
 import { CreateHoldDto } from '../dto/create-reservation.dto';
 import { ConfirmHoldDto } from '../dto/confirm-hold.dto';
 import { CancelReservationDto } from '../dto/cancel-reservation.dto';
@@ -13,6 +14,10 @@ import {
   ReservationResponseDto,
   CancelReservationResponseDto,
 } from '../dto/reservation-response.dto';
+import {
+  ReservationListEntry,
+  toReservationListEntry,
+} from '../dto/reservation-list.dto';
 import { Reservation, ReservationStatus } from '../entity/reservation.entity';
 import { ReservationItem } from '../entity/reservation-item.entity';
 import { CustomException } from '../../common/exception/custom.exception';
@@ -67,6 +72,8 @@ function validateStoreBusinessHours(pickupTime: Date, store: Store): void {
 
 @Injectable()
 export class ReservationService {
+  private readonly logger = new Logger(ReservationService.name);
+
   constructor(
     private readonly dataSource: DataSource,
     private readonly reservationRepository: ReservationRepository,
@@ -76,15 +83,19 @@ export class ReservationService {
   ) {}
 
   /**
-   * POST /v1/reservations/hold
+   * POST /v1/reservations/hold  —  All-or-Nothing 원자적 Hold
    *
-   * 1. pickupTime multi-step 검증
-   * 2. 사용자 / 매장 존재 확인
-   * 3. 각 아이템별 재고 확인 (read-only):
-   *    - available >= qty → HELD
-   *    - available < qty  → OUT_OF_STOCK
-   * 4. HELD 아이템을 Redis에 TTL 2분으로 저장
-   * 5. holdToken + 아이템별 결과 반환
+   * [선 검증 단계]
+   *   1. pickupTime multi-step 검증
+   *   2. 사용자 / 매장 존재 확인 + 영업시간 검사
+   *   3. 전체 아이템 재고를 순차 확인하여 resultItems / heldItems 빌드
+   *
+   * [후 점유 단계]  — 전체 재고 확보 성공(allHeld)인 경우에만 실행
+   *   4. holdToken 생성 + Redis Hold 저장 (TTL 2분)
+   *   5. 세션 → WAITING_FOR_CONFIRM + hold_token 기록
+   *
+   * [실패 처리]  — 단 하나라도 OUT_OF_STOCK이면 Redis Hold를 절대 생성하지 않음
+   *   - 세션 → FAIL + last_error에 상세 실패 사유 기록
    *
    * 재고 차감은 confirm 단계에서만 수행 (동시성: 조건부 UPDATE).
    */
@@ -98,6 +109,7 @@ export class ReservationService {
     if (!store) throw new CustomException(ErrorCode.STORE_NOT_FOUND);
     validateStoreBusinessHours(pickupTime, store);
 
+    // ── 선 검증: 전체 아이템 재고 확인 ─────────────────────────────────────
     const heldItems: HoldData['items'] = [];
     const resultItems: HoldItemResultDto[] = [];
 
@@ -106,13 +118,17 @@ export class ReservationService {
         dto.storeId,
         reqItem.breadId,
       );
+      const breadName = inventory?.bread?.name ?? `빵 #${reqItem.breadId}`;
 
       if (!inventory || inventory.available < reqItem.qty) {
+        const remaining = inventory?.available ?? 0;
         resultItems.push({
-          breadName: inventory?.bread?.name ?? `breadId:${reqItem.breadId}`,
-          requestedQty: reqItem.qty,
-          heldQty: 0,
+          id: String(reqItem.breadId),
+          name: breadName,
+          requestedCount: reqItem.qty,
+          heldCount: 0,
           status: 'OUT_OF_STOCK',
+          reason: `재고 부족 (남은 수량: ${remaining}개)`,
         });
         continue;
       }
@@ -120,33 +136,69 @@ export class ReservationService {
       heldItems.push({
         inventoryId: Number(inventory.id),
         breadId: reqItem.breadId,
-        breadName: inventory.bread?.name ?? `breadId:${reqItem.breadId}`,
+        breadName,
         requestedQty: reqItem.qty,
         heldQty: reqItem.qty,
       });
 
       resultItems.push({
-        breadName: inventory.bread?.name ?? `breadId:${reqItem.breadId}`,
-        requestedQty: reqItem.qty,
-        heldQty: reqItem.qty,
-        status: 'HELD',
+        id: String(reqItem.breadId),
+        name: breadName,
+        requestedCount: reqItem.qty,
+        heldCount: reqItem.qty,
+        status: 'SUCCESS',
       });
     }
 
-    const holdToken = randomUUID();
-    const expiresAt = new Date(Date.now() + HOLD_TTL_SECONDS * 1000).toISOString();
+    const allHeld = heldItems.length === dto.items.length;
+    const userKey = String(dto.userId);
 
-    const holdData: HoldData = {
-      userId: dto.userId,
-      storeId: dto.storeId,
-      pickupTime: pickupTime.toISOString(),
-      items: heldItems,
-      expiresAt,
-    };
+    if (allHeld) {
+      // ── 후 점유: 모두 성공한 경우에만 Redis Hold 생성 ────────────────────
+      const holdToken = randomUUID();
+      const expiresAt = new Date(Date.now() + HOLD_TTL_SECONDS * 1000).toISOString();
 
-    await this.redisHoldService.createHold(holdToken, holdData);
+      await this.redisHoldService.createHold(holdToken, {
+        userId: dto.userId,
+        storeId: dto.storeId,
+        pickupTime: pickupTime.toISOString(),
+        items: heldItems,
+        expiresAt,
+      });
 
-    return { holdToken, items: resultItems };
+      await this.redisHoldService.patchCurrentSession(userKey, {
+        last_store_id: dto.storeId,
+        last_store_name: store.name,
+        hold_token: holdToken,
+        status: SessionStatus.WAITING_FOR_CONFIRM,
+        last_error: undefined,
+      });
+
+      this.logger.log(
+        `[holdReservation] ALL held → WAITING_FOR_CONFIRM` +
+          ` userId=${dto.userId} holdToken=${holdToken} items=${heldItems.length}`,
+      );
+
+      return { success: true, holdToken, items: resultItems };
+    }
+
+    // ── 실패: Redis Hold를 생성하지 않고 실패 정보를 세션에 기록 ─────────────
+    const failedSummary = resultItems
+      .filter((item) => item.status !== 'SUCCESS')
+      .map((item) => `${item.name}: ${item.reason}`)
+      .join(' / ');
+
+    await this.redisHoldService.patchCurrentSession(userKey, {
+      status: SessionStatus.FAIL,
+      last_error: `일부 상품의 재고가 부족합니다 — ${failedSummary}`,
+    });
+
+    this.logger.warn(
+      `[holdReservation] FAIL userId=${dto.userId}` +
+        ` (held=${heldItems.length}/${dto.items.length}) ${failedSummary}`,
+    );
+
+    return { success: false, holdToken: null, items: resultItems };
   }
 
   /**
@@ -163,7 +215,18 @@ export class ReservationService {
    */
   async confirmHold(dto: ConfirmHoldDto): Promise<ReservationResponseDto> {
     const holdData = await this.redisHoldService.getHold(dto.holdToken);
-    if (!holdData) throw new CustomException(ErrorCode.HOLD_NOT_FOUND);
+
+    if (!holdData) {
+      // Hold TTL 만료 또는 존재하지 않는 토큰 → 세션을 EXPIRED로 전이 후 에러 반환
+      await this.redisHoldService.patchCurrentSession(String(dto.userId), {
+        status: SessionStatus.EXPIRED,
+      });
+      this.logger.warn(
+        `[confirmHold] hold not found → session EXPIRED userId=${dto.userId} holdToken=${dto.holdToken}`,
+      );
+      throw new CustomException(ErrorCode.HOLD_EXPIRED);
+    }
+
     if (holdData.userId !== dto.userId) throw new CustomException(ErrorCode.HOLD_USER_MISMATCH);
 
     const pickupTime = new Date(holdData.pickupTime);
@@ -197,6 +260,21 @@ export class ReservationService {
 
     await this.redisHoldService.deleteHold(dto.holdToken);
 
+    // 예약 확정 성공 → COMPLETED 로 세션 상태 전이 후 즉시 SEARCHING으로 초기화
+    const confirmedUserKey = String(dto.userId);
+    await this.redisHoldService.patchCurrentSession(confirmedUserKey, {
+      status: SessionStatus.COMPLETED,
+      hold_token: undefined,
+    });
+    this.logger.log(
+      `[confirmHold] session updated → COMPLETED userId=${dto.userId} reservationId=${savedReservation.id}`,
+    );
+
+    await this.redisHoldService.resetCurrentSession(confirmedUserKey);
+    this.logger.log(
+      `User ${dto.userId}의 세션이 초기화되었습니다. 상태가 SEARCHING으로 리셋됩니다.`,
+    );
+
     return ReservationResponseDto.from(savedReservation);
   }
 
@@ -204,6 +282,23 @@ export class ReservationService {
     const reservation = await this.reservationRepository.findByIdWithItems(id);
     if (!reservation) throw new CustomException(ErrorCode.RESERVATION_NOT_FOUND);
     return ReservationResponseDto.from(reservation);
+  }
+
+  /**
+   * GET /v1/reservations
+   *
+   * userId + status 필터로 예약 목록을 조회합니다.
+   * API 친화적 소문자 status('confirmed' | 'cancelled')를 DB enum으로 변환하여 조회합니다.
+   */
+  async getReservationList(
+    userId: number,
+    status: 'confirmed' | 'cancelled',
+  ): Promise<ReservationListEntry[]> {
+    const dbStatus =
+      status === 'confirmed' ? ReservationStatus.CONFIRMED : ReservationStatus.CANCELLED;
+
+    const reservations = await this.reservationRepository.findByUserIdAndStatus(userId, dbStatus);
+    return reservations.map(toReservationListEntry);
   }
 
   /**
@@ -229,7 +324,7 @@ export class ReservationService {
       ? '취소 수수료 10%가 부과됩니다.'
       : '전액 환불됩니다.';
 
-    return this.dataSource.transaction(async (manager) => {
+    const result = await this.dataSource.transaction(async (manager) => {
       await this.reservationRepository.save(reservation, manager);
 
       for (const item of reservation.items) {
@@ -238,5 +333,22 @@ export class ReservationService {
 
       return CancelReservationResponseDto.from(reservation, feeMessage);
     });
+
+    // 취소 성공 → CANCELLED 로 세션 상태 전이 후 즉시 SEARCHING으로 초기화
+    const userKey = String(dto.userId);
+    await this.redisHoldService.patchCurrentSession(userKey, {
+      status: SessionStatus.CANCELLED,
+      hold_token: undefined,
+    });
+    this.logger.log(
+      `[cancelReservation] session updated → CANCELLED userId=${dto.userId} reservationId=${id}`,
+    );
+
+    await this.redisHoldService.resetCurrentSession(userKey);
+    this.logger.log(
+      `User ${dto.userId}의 세션이 초기화되었습니다. 상태가 SEARCHING으로 리셋됩니다.`,
+    );
+
+    return result;
   }
 }
