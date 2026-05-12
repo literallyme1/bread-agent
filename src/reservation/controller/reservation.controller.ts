@@ -17,6 +17,7 @@ import { CancelReservationDto } from '../dto/cancel-reservation.dto';
 import { HoldResponseDto } from '../dto/hold-response.dto';
 import {
   CancelReservationResponseDto,
+  ConfirmReservationResponseDto,
   ReservationResponseDto,
 } from '../dto/reservation-response.dto';
 import {
@@ -117,23 +118,33 @@ export class ReservationController {
     summary: 'Hold 확정 → 예약 생성',
     description:
       'holdToken 기반으로 Redis Hold를 조회하고 DB에 예약을 확정합니다. ' +
-      '재고 차감은 이 단계에서 조건부 UPDATE(동시성 안전)로 수행됩니다. ' +
-      '확정 후 Redis Hold는 삭제됩니다.',
+      '재고 차감은 이 단계에서 조건부 UPDATE(동시성 안전)로 수행됩니다.\n\n' +
+      '**Side-Effects**\n' +
+      '- Redis Hold 삭제\n' +
+      '- Redis 세션 전체 삭제 (AI 인사 후 다음 예약을 위해 완전 초기화)\n\n' +
+      '응답에 매장 이름·위치, 아이템 이름·수량, 픽업 시각이 포함되어 ' +
+      'AI가 예약 완료 인사 메시지를 바로 구성할 수 있습니다.',
   })
   @ApiOkResponse({
     description: '예약 확정 성공',
     schema: {
       example: {
         data: {
-          id: 1,
+          reservationId: 42,
           userId: 1,
           status: 'CONFIRMED',
-          pickupTime: '2026-05-08T14:00:00.000Z',
-          createdAt: '2026-05-07T10:00:00.000Z',
+          store: {
+            id: 5,
+            name: '하레하레 강남',
+            station: '강남역',
+            address: '서울 강남구 강남대로 100',
+          },
           items: [
-            { id: 1, inventoryId: 10, qty: 2 },
-            { id: 2, inventoryId: 20, qty: 1 },
+            { breadId: 101, breadName: '소금빵', qty: 2 },
+            { breadId: 202, breadName: '크림빵', qty: 1 },
           ],
+          pickupTime: '2026-05-09T20:00:00.000Z',
+          createdAt: '2026-05-09T10:00:00.000Z',
         },
         message: 'Reservation confirmed successfully',
       },
@@ -151,37 +162,35 @@ export class ReservationController {
     description: 'hold TTL 만료',
     schema: errorSchema('Hold token has expired'),
   })
-  async confirmHold(@Body() dto: ConfirmHoldDto): Promise<ApiResponse<ReservationResponseDto>> {
+  async confirmHold(@Body() dto: ConfirmHoldDto): Promise<ApiResponse<ConfirmReservationResponseDto>> {
     this.logger.log(`[confirmHold] userId=${dto.userId} holdToken=${dto.holdToken}`);
     const data = await this.reservationService.confirmHold(dto);
-    this.logger.log(`[confirmHold] userId=${dto.userId} reservationId=${data.id} status=${data.status}`);
+    this.logger.log(`[confirmHold] userId=${dto.userId} reservationId=${data.reservationId} store="${data.store.name}"`);
     return ApiResponse.success(data, 'Reservation confirmed successfully');
   }
 
   /**
    * GET /v1/reservations
-   * userId + status(confirmed|cancelled) 로 예약 목록을 조회합니다.
+   * 취소 가능한 미래 예약 목록 조회 (서버 지능형 필터 적용)
    */
   @Get()
   @ApiOperation({
     operationId: 'listReservations',
-    summary: '예약 목록 조회',
+    summary: '취소 가능한 미래 예약 목록 조회',
     description:
-      'userId와 status 필터로 사용자의 예약 내역을 조회합니다. ' +
-      'status는 confirmed(확정) 또는 cancelled(취소) 중 하나를 전달해야 합니다. ' +
-      '결과는 생성일 기준 최신순으로 반환됩니다.',
+      'userId 기준으로 취소 가능한 미래 예약을 조회합니다.\n\n' +
+      '**서버 자동 필터**\n' +
+      '- status = CONFIRMED (확정된 예약만)\n' +
+      '- pickupTime > 현재 시각 (미래 픽업만)\n\n' +
+      '**Side-Effect**: 취소 가능한 예약이 1건 이상 존재하면 ' +
+      'Redis 세션을 `WAITING_FOR_CANCELLING_CONFIRM`으로 자동 전이합니다. ' +
+      'AI는 이 상태를 확인하고 취소 동의 흐름을 시작합니다.',
   })
   @ApiQuery({
     name: 'userId',
     type: Number,
     description: '조회할 사용자 ID',
     example: 1,
-  })
-  @ApiQuery({
-    name: 'status',
-    enum: ['confirmed', 'cancelled'],
-    description: '예약 상태 필터 (confirmed: 확정 내역 | cancelled: 취소 내역)',
-    example: 'confirmed',
   })
   @ApiOkResponse({
     description: '예약 목록 반환 성공',
@@ -251,12 +260,9 @@ export class ReservationController {
   async listReservations(
     @Query() query: ReservationListQueryDto,
   ): Promise<ApiResponse<ReservationListEntry[]>> {
-    this.logger.log(`[listReservations] userId=${query.userId} status=${query.status}`);
-    const data = await this.reservationService.getReservationList(
-      query.userId,
-      query.status as 'confirmed' | 'cancelled',
-    );
-    this.logger.log(`[listReservations] userId=${query.userId} count=${data.length}`);
+    this.logger.log(`[listReservations] userId=${query.userId}`);
+    const data = await this.reservationService.getReservationList(query.userId);
+    this.logger.log(`[listReservations] userId=${query.userId} cancellable=${data.length}`);
     return ApiResponse.success(data, 'Reservations fetched successfully');
   }
 

@@ -7,8 +7,10 @@ import { ReservationItem } from '../entity/reservation-item.entity';
 
 /**
  * GET /v1/reservations 쿼리 파라미터 스키마.
- * userId는 쿼리 스트링에서 숫자로 coerce되며,
- * status는 API 친화적 소문자('confirmed' | 'cancelled')를 사용합니다.
+ * userId는 쿼리 스트링에서 숫자로 coerce됩니다.
+ *
+ * 서버가 자동으로 status=CONFIRMED + pickupTime > 현재 시각 조건을 적용하여
+ * 취소 가능한 미래 예약만 반환합니다.
  */
 export const ReservationListQuerySchema = z.object({
   userId: z.coerce
@@ -16,14 +18,6 @@ export const ReservationListQuerySchema = z.object({
     .int()
     .positive()
     .describe('조회할 사용자 ID'),
-
-  status: z
-    .enum(['confirmed', 'cancelled'])
-    .describe(
-      '예약 상태 필터:\n' +
-        '  confirmed - 예약이 확정된 내역 조회\n' +
-        '  cancelled - 취소된 예약 내역 조회',
-    ),
 });
 
 export class ReservationListQueryDto extends createZodDto(ReservationListQuerySchema) {}

@@ -11,13 +11,11 @@ import { ConfirmHoldDto } from '../dto/confirm-hold.dto';
 import { CancelReservationDto } from '../dto/cancel-reservation.dto';
 import { HoldResponseDto, HoldItemResultDto } from '../dto/hold-response.dto';
 import {
+  ConfirmReservationResponseDto,
   ReservationResponseDto,
   CancelReservationResponseDto,
 } from '../dto/reservation-response.dto';
-import {
-  ReservationListEntry,
-  toReservationListEntry,
-} from '../dto/reservation-list.dto';
+import { ReservationListEntry, toReservationListEntry } from '../dto/reservation-list.dto';
 import { Reservation, ReservationStatus } from '../entity/reservation.entity';
 import { ReservationItem } from '../entity/reservation-item.entity';
 import { CustomException } from '../../common/exception/custom.exception';
@@ -204,16 +202,14 @@ export class ReservationService {
   /**
    * POST /v1/reservations/confirm
    *
-   * 1. Redis에서 holdToken 조회 (없으면 만료/미존재)
+   * 1. Redis에서 holdToken 조회 (없으면 만료/미존재 → EXPIRED 전이 후 에러)
    * 2. userId 일치 확인
-   * 3. DB 트랜잭션:
-   *    a. HELD 아이템 각각 조건부 UPDATE로 재고 차감
-   *    b. Reservation 생성
-   *    c. ReservationItem 생성
+   * 3. DB 트랜잭션: 재고 차감 → Reservation 생성 → ReservationItem 생성
    * 4. Redis Hold 삭제
-   * 5. ReservationResponseDto 반환
+   * 5. Redis 세션 전체 삭제 (AI 인사 후 재사용을 위해 완전히 제거)
+   * 6. Store 정보를 포함한 풍부한 응답 반환 (AI가 인사 메시지 구성에 활용)
    */
-  async confirmHold(dto: ConfirmHoldDto): Promise<ReservationResponseDto> {
+  async confirmHold(dto: ConfirmHoldDto): Promise<ConfirmReservationResponseDto> {
     const holdData = await this.redisHoldService.getHold(dto.holdToken);
 
     if (!holdData) {
@@ -228,6 +224,9 @@ export class ReservationService {
     }
 
     if (holdData.userId !== dto.userId) throw new CustomException(ErrorCode.HOLD_USER_MISMATCH);
+
+    const store = await this.storeRepository.findById(holdData.storeId);
+    if (!store) throw new CustomException(ErrorCode.STORE_NOT_FOUND);
 
     const pickupTime = new Date(holdData.pickupTime);
 
@@ -258,24 +257,17 @@ export class ReservationService {
       return saved;
     });
 
+    // Hold 삭제 + Redis 세션 전체 삭제
+    // 세션을 리셋이 아닌 삭제하여, 다음 대화 시작 시 완전히 새로운 세션으로 시작합니다.
     await this.redisHoldService.deleteHold(dto.holdToken);
+    await this.redisHoldService.deleteSession(String(dto.userId));
 
-    // 예약 확정 성공 → COMPLETED 로 세션 상태 전이 후 즉시 SEARCHING으로 초기화
-    const confirmedUserKey = String(dto.userId);
-    await this.redisHoldService.patchCurrentSession(confirmedUserKey, {
-      status: SessionStatus.COMPLETED,
-      hold_token: undefined,
-    });
     this.logger.log(
-      `[confirmHold] session updated → COMPLETED userId=${dto.userId} reservationId=${savedReservation.id}`,
+      `[confirmHold] confirmed userId=${dto.userId} reservationId=${savedReservation.id}` +
+        ` store="${store.name}" — session deleted`,
     );
 
-    await this.redisHoldService.resetCurrentSession(confirmedUserKey);
-    this.logger.log(
-      `User ${dto.userId}의 세션이 초기화되었습니다. 상태가 SEARCHING으로 리셋됩니다.`,
-    );
-
-    return ReservationResponseDto.from(savedReservation);
+    return ConfirmReservationResponseDto.from(savedReservation, holdData, store);
   }
 
   async getReservation(id: number): Promise<ReservationResponseDto> {
@@ -287,18 +279,38 @@ export class ReservationService {
   /**
    * GET /v1/reservations
    *
-   * userId + status 필터로 예약 목록을 조회합니다.
-   * API 친화적 소문자 status('confirmed' | 'cancelled')를 DB enum으로 변환하여 조회합니다.
+   * [지능형 필터] 서버가 자동으로 아래 조건을 적용합니다:
+   *   - status = CONFIRMED (확정된 예약만)
+   *   - pickupTime > 현재 시각 (미래 픽업만)
+   *
+   * [Side-Effect] 취소 가능한 예약이 1건 이상 존재하면
+   *   Redis 세션을 WAITING_FOR_CANCELLING_CONFIRM으로 자동 전이합니다.
+   *   AI는 이 상태를 보고 취소 흐름을 시작할 수 있습니다.
    */
-  async getReservationList(
-    userId: number,
-    status: 'confirmed' | 'cancelled',
-  ): Promise<ReservationListEntry[]> {
-    const dbStatus =
-      status === 'confirmed' ? ReservationStatus.CONFIRMED : ReservationStatus.CANCELLED;
+  async getReservationList(userId: number): Promise<ReservationListEntry[]> {
+    const confirmed = await this.reservationRepository.findByUserIdAndStatus(
+      userId,
+      ReservationStatus.CONFIRMED,
+    );
 
-    const reservations = await this.reservationRepository.findByUserIdAndStatus(userId, dbStatus);
-    return reservations.map(toReservationListEntry);
+    const now = new Date();
+    const cancellable = confirmed.filter((r) => r.pickupTime > now);
+
+    if (cancellable.length > 0) {
+      await this.redisHoldService.patchCurrentSession(String(userId), {
+        status: SessionStatus.WAITING_FOR_CANCELLING_CONFIRM,
+      });
+      this.logger.log(
+        `[getReservationList] userId=${userId} cancellable=${cancellable.length}` +
+          ` → session WAITING_FOR_CANCELLING_CONFIRM`,
+      );
+    } else {
+      this.logger.log(
+        `[getReservationList] userId=${userId} no cancellable reservations`,
+      );
+    }
+
+    return cancellable.map(toReservationListEntry);
   }
 
   /**
@@ -334,19 +346,14 @@ export class ReservationService {
       return CancelReservationResponseDto.from(reservation, feeMessage);
     });
 
-    // 취소 성공 → CANCELLED 로 세션 상태 전이 후 즉시 SEARCHING으로 초기화
-    const userKey = String(dto.userId);
-    await this.redisHoldService.patchCurrentSession(userKey, {
+    // 취소 성공 → CANCELLED 로 세션 상태 전이
+    // AI가 취소 완료 메시지를 전달한 뒤 사용자가 새 예약을 시작할 수 있도록
+    // 즉시 리셋하지 않고 CANCELLED 상태를 유지합니다.
+    await this.redisHoldService.patchCurrentSession(String(dto.userId), {
       status: SessionStatus.CANCELLED,
-      hold_token: undefined,
     });
     this.logger.log(
-      `[cancelReservation] session updated → CANCELLED userId=${dto.userId} reservationId=${id}`,
-    );
-
-    await this.redisHoldService.resetCurrentSession(userKey);
-    this.logger.log(
-      `User ${dto.userId}의 세션이 초기화되었습니다. 상태가 SEARCHING으로 리셋됩니다.`,
+      `[cancelReservation] session → CANCELLED userId=${dto.userId} reservationId=${id}`,
     );
 
     return result;

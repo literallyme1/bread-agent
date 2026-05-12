@@ -235,7 +235,8 @@ export class SessionService {
    * 기존 selected_items 목록에 단일 아이템 업데이트를 적용합니다.
    *
    * - count > 0 + 아이템 존재: 수량을 count로 덮어씁니다.
-   * - count > 0 + 아이템 없음: itemName이 있으면 신규 추가, 없으면 목록 유지 후 경고 로그.
+   * - count > 0 + 아이템 없음 + itemName 제공: 신규 아이템으로 목록에 추가합니다.
+   * - count > 0 + 아이템 없음 + itemName 미제공: 400 BadRequestException을 던집니다.
    * - count === 0: 해당 아이템을 목록에서 제거합니다.
    */
   private applyItemUpdate(
@@ -257,10 +258,9 @@ export class SessionService {
 
     // 목록에 없는 신규 아이템: itemName 필수
     if (!itemName) {
-      this.logger.warn(
-        `[applyItemUpdate] userId=${userId} itemId=${itemId} not in list and itemName missing — skipped`,
+      throw new BadRequestException(
+        `itemId=${itemId}은 현재 선택 목록에 없는 신규 아이템입니다. 신규 추가 시 itemName을 함께 제공해야 합니다.`,
       );
-      return items;
     }
 
     return [...items, { id: itemId, name: itemName, count }];
