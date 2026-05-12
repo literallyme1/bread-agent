@@ -76,8 +76,8 @@ export class SessionService {
    */
   async patchSession(userId: string, payload: SessionPatchPayload): Promise<RedisUserSession> {
     // Upsert: rawExisting이 null이면 신규 세션으로 간주.
-    // currentStatus는 rawExisting에서 추출하여, 신규 세션(null)의 경우 undefined로 유지 →
-    // validateTransition이 초기 세션으로 인식하여 모든 상태 전이를 허용합니다.
+    // 신규 세션의 currentStatus는 SEARCHING으로 고정하여 상태 전이 검증이
+    // SEARCHING을 출발점으로 올바르게 적용되도록 합니다.
     const rawExisting = await this.redisService.getSession(userId);
     const existing: RedisUserSession = rawExisting ?? {
       current_session: {
@@ -105,7 +105,11 @@ export class SessionService {
 
     // READY_FOR_SUMMARY 상태에서 정보 수집 필드가 수정되면 status를 SEARCHING으로 롤백.
     // 단, patch에 status가 명시적으로 포함된 경우(= 에이전트가 의도적으로 전이를 지정한 경우)는 롤백하지 않음.
-    const currentStatus = rawExisting?.current_session?.status;
+    // 신규 세션(rawExisting === null)은 SEARCHING을 출발점으로 고정합니다.
+    const currentStatus =
+      rawExisting !== null
+        ? rawExisting?.current_session?.status
+        : SessionStatus.SEARCHING;
     let patch = currentSessionPatch as Partial<CurrentSession>;
     if (
       currentStatus === SessionStatus.READY_FOR_SUMMARY &&
@@ -151,7 +155,8 @@ export class SessionService {
 
   /**
    * 상태 전이 규칙을 검증합니다.
-   * current가 undefined(초기 세션)인 경우 모든 상태 설정을 허용합니다.
+   * current가 undefined인 경우(기존 세션에 status 필드가 없는 비정상 상태) 모든 상태 설정을 허용합니다.
+   * 신규 세션은 호출 전에 currentStatus가 SEARCHING으로 설정되므로 이 분기를 타지 않습니다.
    * 허용되지 않는 전이 시 400 BadRequestException을 던집니다.
    */
   private validateTransition(
@@ -160,7 +165,7 @@ export class SessionService {
     userId: string,
   ): void {
     if (current === undefined) {
-      // 아직 status가 없는 초기 세션 → 어떤 상태든 최초 설정 허용
+      // status 필드가 없는 기존 세션(비정상 케이스) → 복구 허용
       return;
     }
 
