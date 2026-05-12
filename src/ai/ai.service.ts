@@ -64,7 +64,18 @@ export class AiService implements OnModuleInit, OnApplicationShutdown {
       );
 
       if (swaggerDoc) {
-        this.toolset = new OpenApiToolset(swaggerDoc, baseUrl);
+        // AI가 호출하면 안 되거나 지침에 없는 도구를 명시적으로 제외합니다.
+        // - deleteSession : 사용자 세션을 완전 삭제 → 실수 호출 시 치명적
+        // - aiChat        : AI가 자기 자신을 재귀 호출하는 순환 위험
+        // - findStore     : 단건 매장 조회, 지침에 없음 (getStores로 대체)
+        // - findReservation: 단건 예약 조회, 지침에 없음 (listReservations로 대체)
+        const excludedTools = new Set([
+          'deleteSession',
+          'aiChat',
+          'findStore',
+          'findReservation',
+        ]);
+        this.toolset = new OpenApiToolset(swaggerDoc, baseUrl, excludedTools);
         this.logger.log(
           `OpenApiToolset created: ${this.toolset.toolCount} tool(s) from swagger-spec.json`,
         );
@@ -78,7 +89,7 @@ export class AiService implements OnModuleInit, OnApplicationShutdown {
       const agent = new LlmAgent({
         name: 'bread_path_agent',
         description: 'Bread-Path 빵 예약 AI 에이전트',
-        model: 'gemini-3.1-flash-lite',
+        model: 'gemini-2.5-flash',
         instruction: systemInstruction,
         tools: this.toolset ? [this.toolset] : [],
       });
@@ -183,13 +194,7 @@ export class AiService implements OnModuleInit, OnApplicationShutdown {
       `hold_token         : ${hold_token ?? '(없음)'}`,
       `last_error         : ${last_error ?? '(없음)'}`,
       '',
-      '■ [AI 행동 지침] ■',
-      `1. 모든 도구 호출 시 userId는 반드시 '${userId}'로 고정한다.`,
-      '2. [매장 탐색/선택] getStores 호출 시 storeId를 포함하면 서버가 자동으로 해당 매장 문맥을 유지하거나 리셋한다.',
-      '3. [수량 변경] 빵 수량 수정 시 patchSession에 itemId와 최종 count를 넘겨라. (0을 넘기면 서버가 자동 삭제 및 상태 회귀를 처리한다.)',
-      '4. [상태 관리] 네가 직접 status를 READY_FOR_SUMMARY로 바꿀 필요 없다. 필수 정보가 차면 서버 응답에서 status가 자동으로 바뀔 것이다.',
-      '5. [오류 대응] last_error가 감지되면 해당 내용을 유저에게 설명하고, getStores(재탐색)를 통해 세션을 복구하도록 유도하라.',
-      '6. 모든 판단의 근거는 위 Redis 스냅샷과 도구 호출 후 반환되는 최신 세션 데이터를 기준으로 한다.',
+      `※ 모든 tool 호출 시 userId는 반드시 '${userId}'로 고정한다.`,
     ];
 
     return lines.join('\n');
@@ -206,19 +211,35 @@ export class AiService implements OnModuleInit, OnApplicationShutdown {
   /**
    * ADK 이벤트 스트림을 처리하여 최종 응답 텍스트를 반환합니다.
    * - 도구 호출/응답 이벤트는 피드백 루프를 위해 로깅됩니다.
-   * - isFinalResponse 이벤트가 감지되면 해당 텍스트를 반환합니다.
+   * - isFinalResponse는 "도구 호출/응답이 이 이벤트에 없음" 수준이라, 빈 텍스트인
+   *   최종 이벤트가 먼저 오고 이후에 patchSession 등 추가 라운드가 이어질 수 있습니다.
+   *   첫 빈 최종에서 break 하면 스트림을 잘라 reply가 ""가 되므로, 스트림을 끝까지
+   *   읽고 마지막 의미 있는(공백 아닌) 최종 텍스트를 사용합니다.
    */
   private async processEventStream(
     stream: AsyncIterable<unknown>,
     userId: string,
   ): Promise<string> {
-    let finalText = '';
+    let lastFinalText = '';
+    let lastNonEmptyFinalText = '';
 
     for await (const raw of stream) {
       const event = raw as Event;
 
-      // 도구 호출 파트 — AI가 어떤 도구를 호출했는지 기록 (피드백 루프 관찰)
+      // 모든 이벤트 요약 — 스트림 흐름 파악용
       const calls = getFunctionCalls(event);
+      const responses = getFunctionResponses(event);
+      const isFinal = isFinalResponse(event);
+      const text = stringifyContent(event);
+      this.logger.debug(
+        `[event] userId=${userId} author=${event.author} ` +
+        `calls=${calls.map(c => c.name).join(',')||'-'} ` +
+        `responses=${responses.map(r => r.name).join(',')||'-'} ` +
+        `isFinal=${isFinal} partial=${(event as Event & { partial?: boolean }).partial ?? false} ` +
+        `textLen=${text.length}`,
+      );
+
+      // 도구 호출 파트 — AI가 어떤 도구를 호출했는지 기록 (피드백 루프 관찰)
       if (calls.length > 0) {
         for (const call of calls) {
           this.logger.log(
@@ -228,7 +249,6 @@ export class AiService implements OnModuleInit, OnApplicationShutdown {
       }
 
       // 도구 응답 파트 — 도구 실행 결과가 AI에게 피드백되었음을 기록
-      const responses = getFunctionResponses(event);
       if (responses.length > 0) {
         for (const resp of responses) {
           this.logger.log(
@@ -237,14 +257,15 @@ export class AiService implements OnModuleInit, OnApplicationShutdown {
         }
       }
 
-      // 최종 응답 이벤트
-      if (isFinalResponse(event)) {
-        finalText = stringifyContent(event);
-        break;
+      if (isFinal) {
+        lastFinalText = text;
+        if (text.trim()) {
+          lastNonEmptyFinalText = text;
+        }
       }
     }
 
-    return finalText;
+    return lastNonEmptyFinalText || lastFinalText;
   }
 
   /**

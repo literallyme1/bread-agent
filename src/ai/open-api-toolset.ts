@@ -118,11 +118,12 @@ export class OpenApiToolset extends BaseToolset {
   constructor(
     private readonly swaggerDoc: OpenApiDocument,
     private readonly baseUrl: string,
+    private readonly excludedOperations: Set<string> = new Set(),
   ) {
     super(() => true);
     this._tools = this.buildTools();
   }
-  //api 의 종류 확인 후 툴 생성
+
   private buildTools(): FunctionTool[] {
     const tools: FunctionTool[] = [];
     const paths = this.swaggerDoc.paths ?? {};
@@ -132,6 +133,7 @@ export class OpenApiToolset extends BaseToolset {
       for (const [method, operation] of Object.entries(pathItem)) {
         if (!HTTP_METHODS.has(method)) continue;
         if (!operation?.operationId) continue;
+        if (this.excludedOperations.has(operation.operationId)) continue;
 
         const tool = this.createFunctionTool(path, method, operation, components);
         if (tool) tools.push(tool);
@@ -154,8 +156,9 @@ export class OpenApiToolset extends BaseToolset {
     // Track where each param lives so the execute handler can route it correctly
     const paramMeta: Record<string, { in: string }> = {};
 
-    // Path / query parameters
+    // Path / query parameters (헤더 파라미터는 chatContextStorage가 자동 주입하므로 스키마 제외)
     for (const param of parameters) {
+      if (param.in === 'header') continue;
       const schema = resolveRef(param.schema ?? {}, components);
       properties[param.name] = toGeminiSchema(schema, components, param.description);
       paramMeta[param.name] = { in: param.in };
