@@ -1,33 +1,36 @@
 import {
   BadRequestException,
+  ConflictException,
   Injectable,
   Logger,
   NotFoundException,
 } from '@nestjs/common';
+import { DataSource } from 'typeorm';
 import { RedisHoldService } from '../redis/redis.service';
 import {
   CurrentSession,
-  Profile,
   RedisUserSession,
   RedisUserSessionSchema,
   SelectedItem,
   SessionStatus,
   SessionStatusType,
 } from '../redis/session.schema';
+import { Store } from '../store/entity/store.entity';
+import { Inventory } from '../inventory/entity/inventory.entity';
+import {
+  parsePickupInstantFromClientString,
+  isPickupInstantBeforeGraceThreshold,
+  normalizePickupTimeForStorage,
+} from '../common/utils/kst-pickup-time.util';
 
 /**
- * patchSession이 수신하는 통합 패치 페이로드.
+ * patchSession이 수신하는 패치 페이로드.
  *
- * - profile 필드(preferred_station, taste_tags): 최상위로 전달되며 서비스 내부에서 profile 객체에 병합됩니다.
- * - current_session 필드: 나머지 모든 CurrentSession 필드.
- * - itemId + count: 단일 아이템의 최종 목표 수량을 지정합니다. selected_items 배열과 동시에 사용 불가.
+ * - current_session 필드만 수정합니다. profile(preferred_station, taste_tags)은 getStores에서 관리합니다.
+ * - itemId + count: 단일 아이템의 최종 목표 수량을 지정합니다. selected_items와 동시에 사용 불가.
  *   count=0 이면 해당 아이템을 목록에서 제거합니다.
- *
- * AI가 단일 patchSession 호출로 profile과 current_session을 동시에 수정할 수 있습니다.
  */
 export type SessionPatchPayload = Partial<CurrentSession> & {
-  preferred_station?: Profile['preferred_station'];
-  taste_tags?: Profile['taste_tags'];
   /** 수정할 아이템 ID. count와 함께 제공해야 합니다. */
   itemId?: number;
   /** 추가 시 필요한 아이템 이름. itemId가 목록에 없을 때 신규 항목으로 추가됩니다. */
@@ -69,7 +72,10 @@ const SUMMARY_INVALIDATING_FIELDS: ReadonlyArray<keyof CurrentSession> = [
 export class SessionService {
   private readonly logger = new Logger(SessionService.name);
 
-  constructor(private readonly redisService: RedisHoldService) {}
+  constructor(
+    private readonly redisService: RedisHoldService,
+    private readonly dataSource: DataSource,
+  ) {}
 
   /**
    * 사용자의 전체 Redis 세션(Profile + CurrentSession)을 조회합니다.
@@ -84,58 +90,123 @@ export class SessionService {
   }
 
   /**
-   * 세션을 Upsert 방식으로 업데이트합니다.
+   * Redis에 신규 예약 세션을 생성합니다.
    *
-   * - profile 필드(preferred_station, taste_tags)와 current_session 필드를 단일 호출로 함께 수정할 수 있습니다.
-   * - 세션이 없으면 기본 스키마({ status: SEARCHING, selected_items: [] })로 먼저 생성한 뒤 병합합니다.
-   *
-   * 처리 순서:
-   *   1. Upsert: 세션 조회 → 없으면 기본 세션으로 초기화
-   *   2. profile 필드(preferred_station, taste_tags) 분리 → profile 객체에 병합
-   *   3. [STEP 1] itemId + count가 제공된 경우 — 기존 목록에서 해당 아이템 수량을 덮어씁니다.
-   *              count=0이면 목록에서 제거합니다. 결과가 patch.selected_items에 반영됩니다.
-   *   4. itemId 경로가 아닐 때만 — READY_FOR_SUMMARY에서 정보 수집 필드 수정 시 SEARCHING으로 롤백.
-   *   5. itemId 경로가 아닐 때만 — 명시적 status 전이 규칙 검증.
-   *   6. 기존 세션에 병합
-   *   7. [STEP 2] itemId 경로 한정 — 병합 후 selected_items가 비면 SEARCHING으로 강제 복귀.
-   *   8. [STEP 3] itemId 경로 한정 — 병합 후 필수 정보가 모두 충족되면 READY_FOR_SUMMARY로 자동 승격.
-   *   9. RedisUserSessionSchema.safeParse()로 최종 검증 후 Redis 저장
+   * - `current_session.status`는 항상 SEARCHING으로 시작합니다.
+   * - `selected_items`는 빈 배열입니다.
+   * - 이미 세션이 존재하면 세션을 수정하지 않고 ConflictException(409)을 던집니다.
    */
-  async patchSession(userId: string, payload: SessionPatchPayload): Promise<RedisUserSession> {
-    // ── Upsert ───────────────────────────────────────────────────────────────────
-    // 신규 세션의 currentStatus를 SEARCHING으로 고정하여 상태 전이 검증이
-    // SEARCHING을 출발점으로 올바르게 적용되도록 합니다.
-    const rawExisting = await this.redisService.getSession(userId);
-    const existing: RedisUserSession = rawExisting ?? {
+  async createSession(userId: string): Promise<RedisUserSession> {
+    const existing = await this.redisService.getSession(userId);
+    if (existing) {
+      throw new ConflictException(
+        `Session already exists for userId: ${userId}. Use PATCH to update or DELETE before creating again.`,
+      );
+    }
+
+    const draft: RedisUserSession = {
       current_session: {
         status: SessionStatus.SEARCHING,
         selected_items: [],
       },
     };
 
+    const validated = RedisUserSessionSchema.safeParse(draft);
+    if (!validated.success) {
+      this.logger.error(
+        `[createSession] schema validation failed userId=${userId}: ${validated.error.message}`,
+      );
+      throw new BadRequestException('Session data failed schema validation');
+    }
+
+    await this.redisService.setSession(userId, validated.data);
+    this.logger.log(`[createSession] userId=${userId} created with status=SEARCHING`);
+
+    return validated.data;
+  }
+
+  /**
+   * 세션을 Upsert 방식으로 업데이트합니다.
+   *
+   * 세션이 없으면 기본 스키마({ status: SEARCHING, selected_items: [] })로 먼저 생성한 뒤 병합합니다.
+   *
+   * 처리 순서:
+   *   1. Upsert: 세션 조회 → 없으면 기본 세션으로 초기화
+   *   2. [A] 매장 정보 동기화: last_store_id → DB 조회 → last_store_name 자동 채움 (반대도 동일)
+   *   3. [C] pickup_time 검증: 타임존 없으면 KST로 해석, 유예 5초. 저장 시 UTC·Z로 바꾸지 않고 오프셋 없으면 `+09:00`만 붙임
+   *   4. [STEP 1] itemId + count 경로 — 기존 목록에서 해당 아이템 수량을 덮어씁니다(count=0이면 제거)
+   *   5. [B] selected_items 경로 — 신규 아이템을 현재 매장 재고와 대조하여 유효성 검사
+   *   6. itemId 경로가 아닐 때만 — READY_FOR_SUMMARY에서 정보 수집 필드 수정 시 SEARCHING으로 롤백
+   *   7. itemId 경로가 아닐 때만 — 명시적 status 전이 규칙 검증
+   *   8. 기존 세션에 병합
+   *   9. [STEP 2] itemId 경로 한정 — 병합 후 selected_items가 비면 SEARCHING으로 강제 복귀
+   *  10. [D] 공통 자동 승격 — SEARCHING + last_store_id + items(≥1) + pickup_time → READY_FOR_SUMMARY
+   *  11. RedisUserSessionSchema.safeParse()로 최종 검증 후 Redis 저장
+   */
+  async patchSession(userId: string, payload: SessionPatchPayload): Promise<RedisUserSession> {
+    // ── Upsert ───────────────────────────────────────────────────────────────────
+    const rawExisting = await this.redisService.getSession(userId);
+    const existing: RedisUserSession = rawExisting ?? {
+      current_session: { status: SessionStatus.SEARCHING, selected_items: [] },
+    };
     if (!rawExisting) {
       this.logger.log(`[patchSession] userId=${userId} session not found — auto-creating with SEARCHING defaults`);
     }
 
-    // ── 필드 분리 ─────────────────────────────────────────────────────────────────
-    const { preferred_station, taste_tags, itemId, itemName, count, ...currentSessionPatch } = payload;
-
-    // ── Profile 병합 (제공된 필드만 덮어씀) ─────────────────────────────────────────
-    const updatedProfile: RedisUserSession['profile'] =
-      preferred_station !== undefined || taste_tags !== undefined
-        ? ({
-            ...existing.profile,
-            ...(preferred_station !== undefined ? { preferred_station } : {}),
-            ...(taste_tags !== undefined        ? { taste_tags }        : {}),
-          } as Profile)
-        : existing.profile;
-
-    // ── STEP 1: 아이템 단위 수량 덮어쓰기 ────────────────────────────────────────
-    // AI가 '최종 목표 수량(Desired State)'을 보내면 서버가 기존 목록에 반영합니다.
-    // count=0이면 해당 아이템을 제거합니다. selected_items와 동시에 사용 불가.
-    let itemUpdateApplied = false;
+    // ── 필드 추출 ─────────────────────────────────────────────────────────────────
+    const { itemId, itemName, count, ...currentSessionPatch } = payload;
     let patch = currentSessionPatch as Partial<CurrentSession>;
 
+    // ── [A] 매장 정보 동기화 ──────────────────────────────────────────────────────
+    // last_store_id → DB 조회 → last_store_name 자동 채움
+    // last_store_name only → DB 조회 → last_store_id 자동 채움
+    if (patch.last_store_id !== undefined) {
+      const store = await this.dataSource
+        .getRepository(Store)
+        .findOne({ where: { id: patch.last_store_id }, select: ['id', 'name'] });
+      if (!store) {
+        throw new BadRequestException(
+          `last_store_id=${patch.last_store_id}에 해당하는 매장을 찾을 수 없습니다. 올바른 매장 ID를 확인해주세요.`,
+        );
+      }
+      patch = {
+        ...patch,
+        last_store_id: Number(store.id),
+        last_store_name: store.name,
+      };
+      this.logger.log(`[patchSession] userId=${userId} [A] id=${store.id} → name="${store.name}"`);
+    } else if (patch.last_store_name !== undefined) {
+      const store = await this.dataSource
+        .getRepository(Store)
+        .findOne({ where: { name: patch.last_store_name }, select: ['id', 'name'] });
+      if (!store) {
+        throw new BadRequestException(
+          `last_store_name="${patch.last_store_name}"에 해당하는 매장을 찾을 수 없습니다. 올바른 매장 이름을 확인해주세요.`,
+        );
+      }
+      patch = {
+        ...patch,
+        last_store_id: Number(store.id),
+        last_store_name: store.name,
+      };
+      this.logger.log(`[patchSession] userId=${userId} [A] name="${store.name}" → id=${store.id}`);
+    }
+
+    // ── [C] 픽업 시간 검증 (타임존 생략 시 KST 벽시각으로 해석) ─────────────────────
+    // 저장: UTC Z로 바꾸지 않음. 오프셋 없으면 +09:00만 붙여 클라이언트가 보낸 시각을 유지한다.
+    if (patch.pickup_time !== undefined) {
+      const raw = String(patch.pickup_time);
+      const pickupDate = parsePickupInstantFromClientString(raw);
+      if (isPickupInstantBeforeGraceThreshold(pickupDate, 5_000)) {
+        throw new BadRequestException(
+          `pickup_time은 예약 가능한 시각이어야 합니다. (입력값: ${patch.pickup_time}, KST 기준 해석)`,
+        );
+      }
+      patch = { ...patch, pickup_time: normalizePickupTimeForStorage(raw) };
+    }
+
+    // ── STEP 1: 아이템 단위 수량 덮어쓰기 ─────────────────────────────────────────
+    let itemUpdateApplied = false;
     if (itemId !== undefined && count !== undefined) {
       const existingItems = existing.current_session?.selected_items ?? [];
       const resolvedItems = this.applyItemUpdate(existingItems, itemId, count, itemName, userId);
@@ -147,8 +218,47 @@ export class SessionService {
       );
     }
 
+    // ── [B] 장바구니 유효성 검사 (selected_items 전달 시만 수행) ─────────────────────
+    // itemId 경로는 단순 수량 업데이트이므로 무거운 검증 생략.
+    // 기존 세션에 없는 신규 아이템 ID만 현재 매장 재고와 대조합니다.
+    if (patch.selected_items !== undefined && !itemUpdateApplied) {
+      const resolvedStoreId = patch.last_store_id ?? existing.current_session?.last_store_id;
+      if (resolvedStoreId !== undefined && patch.selected_items.length > 0) {
+        const existingItemIds = new Set(
+          (existing.current_session?.selected_items ?? []).map((i) => Number(i.id)),
+        );
+        const newItems = patch.selected_items.filter(
+          (item) => !existingItemIds.has(Number(item.id)),
+        );
+
+        if (newItems.length > 0) {
+          // PostgreSQL bigint → 드라이버에 따라 breadId가 string으로 올 수 있음.
+          // JSON의 item.id는 number라 Set.has()가 실패하지 않도록 숫자로 통일한다.
+          const storeIdNum = Number(resolvedStoreId);
+          const inventoryRows = await this.dataSource
+            .getRepository(Inventory)
+            .find({ where: { storeId: storeIdNum }, select: ['breadId'] });
+          const validBreadIds = new Set(
+            inventoryRows.map((row) => Number(row.breadId)),
+          );
+
+          const invalidItems = newItems.filter(
+            (item) => !validBreadIds.has(Number(item.id)),
+          );
+          if (invalidItems.length > 0) {
+            throw new BadRequestException(
+              `다음 아이템은 매장(ID=${resolvedStoreId})에 존재하지 않는 메뉴입니다: ` +
+                invalidItems.map((i) => `${i.name}(ID=${i.id})`).join(', '),
+            );
+          }
+          this.logger.log(
+            `[patchSession] userId=${userId} [B] ${newItems.length}개 신규 아이템 재고 검증 통과`,
+          );
+        }
+      }
+    }
+
     // ── SUMMARY_INVALIDATING 롤백 (itemId 경로 제외) ─────────────────────────────
-    // itemId 경로는 STEP 2/3 자동 규칙이 상태를 관리하므로 롤백 생략.
     const currentStatus =
       rawExisting !== null
         ? rawExisting?.current_session?.status
@@ -169,7 +279,6 @@ export class SessionService {
     }
 
     // ── 명시적 status 전이 검증 (itemId 경로 제외) ────────────────────────────────
-    // itemId 경로는 STEP 2/3 자동 규칙이 최종 상태를 결정합니다.
     if (!itemUpdateApplied && patch.status !== undefined) {
       this.validateTransition(currentStatus, patch.status, userId);
     }
@@ -181,8 +290,6 @@ export class SessionService {
     } as CurrentSession;
 
     // ── STEP 2: Fallback — 아이템이 비면 SEARCHING으로 강제 복귀 ─────────────────
-    // 아이템 업데이트 결과 selected_items가 빈 배열이 되면 예약 진행이 불가능합니다.
-    // 이 복귀는 상태 전이 검증을 우회하는 서버 주도 방어 로직입니다.
     if (itemUpdateApplied && (mergedSession.selected_items?.length ?? 0) === 0) {
       mergedSession = {
         ...mergedSession,
@@ -190,30 +297,27 @@ export class SessionService {
         pickup_time: undefined,
         hold_token: undefined,
       };
-      this.logger.log(
-        `[patchSession] userId=${userId} auto-fallback: SEARCHING (selected_items empty)`,
-      );
+      this.logger.log(`[patchSession] userId=${userId} auto-fallback: SEARCHING (selected_items empty)`);
     }
 
-    // ── STEP 3: Promotion — 필수 예약 정보 완비 시 READY_FOR_SUMMARY 자동 승격 ────
-    // SEARCHING 상태에서 last_store_id + selected_items(≥1) + pickup_time이 모두
-    // 충족되면 AI 호출 없이 서버가 직접 READY_FOR_SUMMARY로 전이합니다.
+    // ── [D] 자동 승격: SEARCHING → READY_FOR_SUMMARY (모든 경로 공통) ────────────
+    // 모든 필수 예약 정보가 충족된 경우 AI 호출 없이 서버가 직접 승격합니다.
     else if (
-      itemUpdateApplied &&
       mergedSession.status === SessionStatus.SEARCHING &&
       mergedSession.last_store_id !== undefined &&
       (mergedSession.selected_items?.length ?? 0) >= 1 &&
       mergedSession.pickup_time !== undefined
     ) {
       mergedSession = { ...mergedSession, status: SessionStatus.READY_FOR_SUMMARY };
-      this.logger.log(
-        `[patchSession] userId=${userId} auto-promoted: SEARCHING → READY_FOR_SUMMARY`,
-      );
+      this.logger.log(`[patchSession] userId=${userId} [D] auto-promoted: SEARCHING → READY_FOR_SUMMARY`);
     }
+
+    // Store/Inventory bigint → 드라이버에 따라 문자열이 섞이면 Redis Zod 스키마(z.number())가 실패한다.
+    mergedSession = this.normalizeCurrentSessionNumericIds(mergedSession);
 
     // ── Schema 검증 + 저장 ────────────────────────────────────────────────────────
     const updated: RedisUserSession = {
-      profile: updatedProfile,
+      profile: existing.profile,
       current_session: mergedSession,
     };
 
@@ -235,6 +339,28 @@ export class SessionService {
   }
 
   /**
+   * PostgreSQL bigint 등으로 last_store_id·아이템 id가 문자열로 섞이면
+   * RedisUserSessionSchema의 z.number() 검증이 실패한다. 저장 직전에 숫자로 통일한다.
+   */
+  private normalizeCurrentSessionNumericIds(session: CurrentSession): CurrentSession {
+    let next: CurrentSession = { ...session };
+    if (next.last_store_id !== undefined && next.last_store_id !== null) {
+      next = { ...next, last_store_id: Number(next.last_store_id) };
+    }
+    if (next.selected_items?.length) {
+      next = {
+        ...next,
+        selected_items: next.selected_items.map((it) => ({
+          ...it,
+          id: Number(it.id),
+          count: Number(it.count),
+        })),
+      };
+    }
+    return next;
+  }
+
+  /**
    * 기존 selected_items 목록에 단일 아이템 업데이트를 적용합니다.
    *
    * - count > 0 + 아이템 존재: 수량을 count로 덮어씁니다.
@@ -249,7 +375,7 @@ export class SessionService {
     itemName: string | undefined,
     userId: string,
   ): SelectedItem[] {
-    if (count === 0) {
+    if (count <= 0) {
       return items.filter((item) => item.id !== itemId);
     }
 

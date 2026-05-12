@@ -1,9 +1,10 @@
-import { Body, Controller, Get, Logger, Param, ParseIntPipe, Post, Query } from '@nestjs/common';
+import { Body, BadRequestException, Controller, Get, Headers, Logger, Param, ParseIntPipe, Post, Query } from '@nestjs/common';
 import {
   ApiBadRequestResponse,
   ApiConflictResponse,
   ApiCreatedResponse,
   ApiGoneResponse,
+  ApiHeader,
   ApiNotFoundResponse,
   ApiOkResponse,
   ApiOperation,
@@ -11,7 +12,6 @@ import {
   ApiTags,
 } from '@nestjs/swagger';
 import { ReservationService } from '../service/reservation.service';
-import { CreateHoldDto } from '../dto/create-reservation.dto';
 import { ConfirmHoldDto } from '../dto/confirm-hold.dto';
 import { CancelReservationDto } from '../dto/cancel-reservation.dto';
 import { HoldResponseDto } from '../dto/hold-response.dto';
@@ -39,16 +39,35 @@ export class ReservationController {
   @Post('hold')
   @ApiOperation({
     operationId: 'holdReservation',
-    summary: '재고 임시 hold 생성 (All-or-Nothing)',
+    summary: '재고 임시 hold (Thin API — 요청 바디 없음)',
     description:
-      '픽업 시각 검증 → 전체 아이템 재고 확인 → All-or-Nothing 방식으로 Redis Hold 저장 (TTL 2분).\n\n' +
-      '**All-or-Nothing 규칙**\n' +
-      '- 요청한 모든 아이템의 재고가 충분할 때만 holdToken을 발급하고 Redis에 Hold를 생성합니다.\n' +
-      '- 단 하나라도 재고 부족이면 Redis Hold를 생성하지 않고 `success: false`와 상세 실패 목록을 반환합니다.\n\n' +
-      '**세션 상태 전이**\n' +
-      '- 성공: `READY_FOR_SUMMARY → WAITING_FOR_CONFIRM` (hold_token 함께 저장)\n' +
-      '- 실패: 현재 상태 → `FAIL` (last_error에 실패 사유 기록)\n\n' +
-      '실제 재고 차감은 `/confirm` 단계에서만 수행됩니다.',
+      '**요청 바디 없음.** Redis 세션의 `last_store_id`, `selected_items`, `pickup_time`만 사용합니다.\n\n' +
+      '**userId**: 쿼리 `userId` 또는 `X-Chat-User-Id` 헤더(우선)로 전달합니다.\n\n' +
+      '**필수 세션 필드** — 하나라도 없으면 400:\n' +
+      '- `last_store_id`\n' +
+      '- `selected_items` (1개 이상)\n' +
+      '- `pickup_time`\n\n' +
+      '**픽업 시각**: `Z`/`±offset`이 없으면 문자열을 **KST(Asia/Seoul) 벽시각**으로 해석합니다. ' +
+      '[현재 − 5초] 이전이면 `예약 가능한 시간이 지났습니다`(400). ' +
+      '영업 시간은 픽업 **절대 시각**을 서울 시계로 환산한 시·분으로 판단합니다.\n\n' +
+      '**All-or-Nothing**\n' +
+      '- 전 아이템 재고 충족 시에만 `holdToken` 발급 + Redis Hold(TTL 2분)\n' +
+      '- 실패 시 Hold 미생성, 세션 `FAIL` + `last_error`\n\n' +
+      '**성공 시 세션**: `READY_FOR_SUMMARY` 등 → `WAITING_FOR_CONFIRM`, `hold_token` 저장',
+  })
+  @ApiQuery({
+    name: 'userId',
+    required: false,
+    type: String,
+    description:
+      '예약 사용자 ID (Redis 세션 키와 동일). `X-Chat-User-Id`가 있으면 쿼리보다 헤더가 우선합니다.',
+    example: '1',
+  })
+  @ApiHeader({
+    name: 'X-Chat-User-Id',
+    description: 'AI 도구 호출 시 신뢰 userId. 있으면 쿼리 `userId`를 덮어씁니다.',
+    required: false,
+    example: '1',
   })
   @ApiCreatedResponse({
     description: '전체 hold 성공 — holdToken 발급',
@@ -90,21 +109,28 @@ export class ReservationController {
     },
   })
   @ApiBadRequestResponse({
-    description: '잘못된 픽업 시각 또는 영업시간 외',
-    schema: errorSchema('Pickup time must be a valid future datetime'),
+    description:
+      '세션 필수값 누락, userId 누락, 픽업 시각 경과(예약 가능한 시간이 지났습니다), 잘못된 ISO 등',
+    schema: errorSchema('Redis 세션에 last_store_id, selected_items(1개 이상), pickup_time이 모두 필요합니다.'),
   })
   @ApiNotFoundResponse({
     description: '사용자 또는 매장 없음',
     schema: errorSchema('Store not found'),
   })
-  async holdReservation(@Body() dto: CreateHoldDto): Promise<ApiResponse<HoldResponseDto>> {
+  async holdReservation(
+    @Query('userId') userId?: string,
+    @Headers('x-chat-user-id') trustedUserId?: string,
+  ): Promise<ApiResponse<HoldResponseDto>> {
+    const effectiveUserId = (trustedUserId ?? userId)?.trim();
+    if (!effectiveUserId) {
+      throw new BadRequestException(
+        'userId가 필요합니다. 쿼리 ?userId= 또는 X-Chat-User-Id 헤더를 사용하세요.',
+      );
+    }
+    this.logger.log(`[holdReservation] userId=${effectiveUserId}${trustedUserId ? ' (via X-Chat-User-Id)' : ''}`);
+    const data = await this.reservationService.holdReservation(effectiveUserId);
     this.logger.log(
-      `[holdReservation] userId=${dto.userId} storeId=${dto.storeId}` +
-        ` items=${dto.items.length} pickupTime=${dto.pickupTime}`,
-    );
-    const data = await this.reservationService.holdReservation(dto);
-    this.logger.log(
-      `[holdReservation] userId=${dto.userId} success=${data.success} holdToken=${data.holdToken}`,
+      `[holdReservation] userId=${effectiveUserId} success=${data.success} holdToken=${data.holdToken}`,
     );
     return ApiResponse.success(data, 'Hold created successfully');
   }

@@ -54,7 +54,7 @@ const HTTP_METHODS = new Set(['get', 'post', 'put', 'patch', 'delete']);
 
 function resolveRef(schema: OpenApiSchema, components: OpenApiComponents): OpenApiSchema {
   if (!schema?.$ref) return schema;
-  // '#/components/schemas/CreateHoldDto' → ['components', 'schemas', 'CreateHoldDto']
+  // '#/components/schemas/SomeDto' → ['components', 'schemas', 'SomeDto']
   const parts = schema.$ref.replace('#/', '').split('/');
   const root: Record<string, unknown> = { components };
   let current: unknown = root;
