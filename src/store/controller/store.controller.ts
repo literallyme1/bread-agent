@@ -22,7 +22,7 @@ export class StoreController {
    */
   @Get()
   @ApiOperation({
-    operationId: 'findStores',
+    operationId: 'getStores',
     summary: '매장 목록 조회',
     description:
       '역 이름 기준으로 매장·재고·태그를 한 번에 조회합니다. ' +

@@ -9,9 +9,13 @@ import {
   Logger,
   Param,
   Patch,
+  Post,
 } from '@nestjs/common';
 import {
   ApiBadRequestResponse,
+  ApiConflictResponse,
+  ApiCreatedResponse,
+  ApiExcludeEndpoint,
   ApiHeader,
   ApiNoContentResponse,
   ApiNotFoundResponse,
@@ -22,48 +26,114 @@ import {
 } from '@nestjs/swagger';
 import { createZodDto } from 'nestjs-zod';
 import { SessionService, SessionPatchPayload } from './session.service';
-import { CurrentSessionSchema, ProfileSchema, SelectedItemSchema, SessionStatusZodSchema } from '../redis/session.schema';
+import { CurrentSessionSchema, SessionStatusZodSchema } from '../redis/session.schema';
 import { ApiResponse, errorSchema } from '../common/dto/api-response.dto';
 import { z } from 'zod';
+
+/**
+ * Swagger Try it out / 일부 클라이언트가 숫자 필드에 null·""·"123" 문자열을 보내면
+ * z.number()가 즉시 실패하고, nestjs-zod는 컨트롤러 진입 전 "Validation failed"만 반환한다.
+ * (이 경우 SessionService까지 가지 않아 `[patchSession]` 로그가 남지 않음.)
+ */
+function patchOptionalInt(intBase: z.ZodNumber) {
+  return z.preprocess((v: unknown) => {
+    if (v === null || v === undefined || v === '') return undefined;
+    if (typeof v === 'string' && /^-?\d+$/.test(v.trim())) return Number(v.trim());
+    return v;
+  }, intBase.optional());
+}
+
+function patchCoerceInt(intBase: z.ZodNumber) {
+  return z.preprocess((v: unknown) => {
+    if (typeof v === 'string' && /^-?\d+$/.test(v.trim())) return Number(v.trim());
+    return v;
+  }, intBase);
+}
+
+const PatchSelectedItemSchema = z.object({
+  id: patchCoerceInt(z.number().int()),
+  name: z.string(),
+  count: patchCoerceInt(z.number().int().min(1)),
+});
 
 // ─── Request DTO — Partial Update / Upsert ───────────────────────────────────
 
 /**
  * PATCH /v1/session/:userId 요청 바디.
  *
- * profile 필드(preferred_station, taste_tags)와 current_session 필드를 하나의 요청으로 함께 수정할 수 있습니다.
+ * current_session 필드를 선택적으로 수정합니다(Partial Update / Upsert).
  * 전달된 필드만 기존 세션에 병합되며, 나머지 필드는 그대로 유지됩니다.
  * 세션이 없으면 기본값(SEARCHING)으로 자동 생성 후 병합합니다(Upsert).
+ *
+ * ※ profile 필드(preferred_station, taste_tags)는 getStores에서 자동 관리되므로 여기서 제외합니다.
+ *
+ * [서버 자동 처리]
+ *   A. last_store_id 전달 시: DB에서 매장명을 조회하여 last_store_name을 자동 채웁니다.
+ *      last_store_name만 전달 시: DB에서 매장 ID를 찾아 last_store_id를 자동 채웁니다.
+ *   B. selected_items 전달 시: 신규 아이템을 현재 매장 재고와 대조하여 유효성을 검사합니다.
+ *   통과 시 저장값: `Z`/offset이 있으면 그대로, 없으면 입력 시각에 `+09:00`만 덧붙임(UTC `toISOString()`으로 바꾸지 않음).
+ *   D. 검증 완료 후 last_store_id + selected_items(≥1) + pickup_time 모두 존재 시:
+ *      status를 자동으로 READY_FOR_SUMMARY로 승격합니다.
+ *
+ * [아이템 단위 수정 — itemId + count]
+ *   selected_items 배열 전체를 보내는 대신 특정 아이템 ID와 최종 목표 수량(count)을 지정합니다.
+ *   count=0이면 해당 아이템을 목록에서 제거합니다.
+ *   selected_items와 동시에 사용할 수 없습니다.
+ *   수정 결과 selected_items가 비면 status 자동 → SEARCHING, pickup_time/hold_token 초기화.
  */
-const PatchSessionSchema = z.object({
-  // ── profile 필드 ────────────────────────────────────────────────────────────
-  preferred_station: ProfileSchema.shape.preferred_station.optional().describe(
-    '사용자 선호 지역(역명). profile.preferred_station에 저장됩니다. (예: "신중동역")',
-  ),
-  taste_tags: ProfileSchema.shape.taste_tags.optional().describe(
-    '취향 태그 배열. profile.taste_tags에 저장됩니다. (예: ["달지않음", "건강빵"])',
-  ),
-  // ── current_session 필드 ────────────────────────────────────────────────────
-  last_store_id: CurrentSessionSchema.shape.last_store_id,
-  last_store_name: CurrentSessionSchema.shape.last_store_name,
-  selected_items: z.array(SelectedItemSchema).optional().describe(
-    '선택한 아이템 목록. 각 요소: { id: number, name: string, count: number }',
-  ),
-  pickup_time: CurrentSessionSchema.shape.pickup_time,
-  hold_token: CurrentSessionSchema.shape.hold_token,
-  status: SessionStatusZodSchema.optional().describe(
-    '변경할 예약 상태:\n' +
-      '  SEARCHING                      - 예약 정보를 수집 중인 초기 탐색 상태\n' +
-      '  READY_FOR_SUMMARY              - 모든 정보 수집 완료 후 최종 요약을 보여주고 사용자 승인을 기다리는 상태\n' +
-      '  PRE_HOLD_CONFIRM               - 요약 승인 후 실제 hold 점유를 시도하기 직전의 상태\n' +
-      '  WAITING_FOR_CONFIRM            - holdReservation 성공(전 아이템 hold) 후 2분 내 확정 대기\n' +
-      '  WAITING_FOR_CANCELLING_CONFIRM - 취소 요청 후 수수료 고지, 사용자 최종 동의 대기\n' +
-      '  COMPLETED                      - 예약이 성공적으로 확정된 상태\n' +
-      '  CANCELLED                      - 예약 취소가 완료된 상태\n' +
-      '  FAIL                           - 재고 부족 또는 시스템 오류로 중단된 상태\n' +
-      '  EXPIRED                        - Hold TTL 만료로 예약 진행 불가',
-  ),
-});
+const PatchSessionSchema = z
+  .object({
+    // ── current_session 필드 ──────────────────────────────────────────────────
+    last_store_id: patchOptionalInt(z.number().int()),
+    last_store_name: z.preprocess(
+      (v: unknown) => (v === null || v === '' ? undefined : v),
+      CurrentSessionSchema.shape.last_store_name,
+    ),
+    selected_items: z.array(PatchSelectedItemSchema).optional().describe(
+      '아이템 목록 전체 교체. itemId와 동시 사용 불가. 각 요소: { id, name, count }',
+    ),
+    pickup_time: z.preprocess(
+      (v: unknown) => (v === null || v === '' ? undefined : v),
+      CurrentSessionSchema.shape.pickup_time,
+    ),
+    hold_token: z.preprocess(
+      (v: unknown) => (v === null || v === '' ? undefined : v),
+      CurrentSessionSchema.shape.hold_token,
+    ),
+    status: SessionStatusZodSchema.optional().describe(
+      '변경할 예약 상태:\n' +
+        '  SEARCHING                      - 예약 정보를 수집 중인 초기 탐색 상태\n' +
+        '  READY_FOR_SUMMARY              - 모든 정보 수집 완료 후 최종 요약을 보여주고 사용자 승인을 기다리는 상태\n' +
+        '  WAITING_FOR_CONFIRM            - holdReservation 성공(전 아이템 hold) 후 2분 내 확정 대기\n' +
+        '  WAITING_FOR_CANCELLING_CONFIRM - 취소 요청 후 수수료 고지, 사용자 최종 동의 대기\n' +
+        '  COMPLETED                      - 예약이 성공적으로 확정된 상태\n' +
+        '  CANCELLED                      - 예약 취소가 완료된 상태\n' +
+        '  FAIL                           - 재고 부족 또는 시스템 오류로 중단된 상태\n' +
+        '  EXPIRED                        - Hold TTL 만료로 예약 진행 불가\n' +
+        '  ※ itemId + count 사용 시 서버 자동 규칙이 최종 상태를 결정합니다.',
+    ),
+    // ── 아이템 단위 수정 필드 ──────────────────────────────────────────────────
+    itemId: patchOptionalInt(z.number().int().positive()).describe(
+      '수정할 아이템 ID. count와 함께 제공해야 합니다. selected_items와 동시 사용 불가.',
+    ),
+    itemName: z.preprocess(
+      (v: unknown) => (v === null || v === '' ? undefined : v),
+      z.string().optional(),
+    ).describe(
+      '추가할 아이템 이름. itemId에 해당하는 아이템이 목록에 없을 때 신규 추가에 사용됩니다.',
+    ),
+    count: patchOptionalInt(z.number().int().min(0)).describe(
+      '아이템의 최종 목표 수량. 0이면 해당 아이템을 목록에서 제거합니다. itemId와 함께 제공해야 합니다.',
+    ),
+  })
+  .refine(
+    (data) => !(data.itemId !== undefined && data.selected_items !== undefined),
+    { message: 'itemId와 selected_items는 동시에 사용할 수 없습니다.' },
+  )
+  .refine(
+    (data) => (data.itemId === undefined) === (data.count === undefined),
+    { message: 'itemId와 count는 반드시 함께 제공해야 합니다.' },
+  );
 
 class PatchSessionDto extends createZodDto(PatchSessionSchema) {}
 
@@ -74,7 +144,6 @@ const SESSION_STATUS_SCHEMA = {
   enum: [
     'SEARCHING',
     'READY_FOR_SUMMARY',
-    'PRE_HOLD_CONFIRM',
     'WAITING_FOR_CONFIRM',
     'WAITING_FOR_CANCELLING_CONFIRM',
     'COMPLETED',
@@ -87,7 +156,6 @@ const SESSION_STATUS_SCHEMA = {
     'Redis 세션 예약 상태 (DB ReservationStatus와 분리된 세션 전용 상태값):\n' +
     '  SEARCHING - 예약 정보를 수집 중인 초기 탐색 상태\n' +
     '  READY_FOR_SUMMARY - 모든 정보 수집 완료 후 최종 요약을 보여주고 사용자 승인을 기다리는 상태\n' +
-    '  PRE_HOLD_CONFIRM - 요약 승인 후 실제 hold 점유를 시도하기 직전의 상태\n' +
     '  WAITING_FOR_CONFIRM - holdReservation 성공 후 2분 내 최종 확정 대기\n' +
     '  WAITING_FOR_CANCELLING_CONFIRM - 취소 요청 후 수수료 고지, 사용자 최종 동의 대기\n' +
     '  COMPLETED - 예약이 성공적으로 확정된 상태\n' +
@@ -231,17 +299,38 @@ export class SessionController {
   }
 
   /**
+   * POST /v1/session/:userId
+   */
+  @ApiExcludeEndpoint()
+  @Post(':userId')
+  @HttpCode(HttpStatus.CREATED)
+  async createSession(
+    @Param('userId') userId: string,
+  ) {
+
+    const data = await this.sessionService.createSession(userId);
+    return ApiResponse.success(data, 'Session created successfulluserIdy');
+  }
+
+  /**
    * PATCH /v1/session/:userId
    */
   @Patch(':userId')
   @ApiOperation({
     operationId: 'patchSession',
-    summary: 'current_session Upsert (생성 또는 업데이트)',
+    summary: '예약 세션 동기화 — 매장·장바구니·시간 저장 (Upsert)',
     description:
-      'Body에 포함된 필드만 기존 current_session에 병합합니다(Partial Update). ' +
-      '세션이 존재하지 않으면 기본 스키마(SEARCHING)로 자동 생성 후 병합합니다(Upsert). ' +
-      'AI 에이전트가 의도에 따라 상태를 전이하거나 특정 세션 필드를 변경할 때 사용합니다. ' +
-      'X-Chat-User-Id 헤더가 존재하면 path의 userId 대신 해당 값을 사용합니다(AI 호출 보안).',
+      'AI가 수집한 예약 정보(매장 / 아이템 / 픽업 시간)를 Redis 세션에 저장합니다.\n\n' +
+      '전달된 필드만 기존 세션에 병합(Partial Update)하며, 세션이 없으면 자동 생성(Upsert)합니다.\n\n' +
+      '**서버 자동 처리 (Side-Effects)**\n' +
+      '- [A] `last_store_id` 전달 → DB 조회로 `last_store_name` 자동 채움 (반대도 동일)\n' +
+      '- [B] `selected_items` 전달 시 신규 아이템을 현재 매장 재고와 대조하여 유효성 검사\n' +
+      '- [C] `pickup_time` — 오프셋 없으면 **KST**로 해석·검증 후, 저장 시 **UTC·Z로 바꾸지 않고** 필요 시 `+09:00`만 덧붙임\n' +
+      '- [D] 세션에 `last_store_id` + `selected_items(≥1)` + `pickup_time` 모두 존재하면 `READY_FOR_SUMMARY`로 자동 승격\n\n' +
+      '**아이템 단위 수정 — `itemId` + `count`**\n' +
+      '`selected_items` 배열 전체 대신 특정 아이템 ID와 최종 목표 수량(count)을 지정합니다.\n' +
+      'count=0이면 해당 아이템을 제거합니다.\n\n' +
+      '`X-Chat-User-Id` 헤더가 존재하면 path의 userId 대신 해당 값을 사용합니다(AI 호출 보안).',
   })
   @ApiParam({ name: 'userId', type: String, description: '사용자 ID', example: '1' })
   @ApiHeader({
@@ -265,7 +354,7 @@ export class SessionController {
             selected_items: [{ id: 101, name: '소금빵', count: 2 }],
             pickup_time: '2026-05-09T20:00:00',
             hold_token: 'h-8291-abc-xyz',
-            status: 'PRE_HOLD_CONFIRM',
+            status: 'WAITING_FOR_CONFIRM',
             last_error: null,
           },
         },

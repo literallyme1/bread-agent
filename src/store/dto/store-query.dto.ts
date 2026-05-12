@@ -7,9 +7,20 @@ import { Station } from '../../common/enums/station.enum';
 const StoreQuerySchema = z.object({
   userId: z
     .string()
+    .describe('사용자 ID. Redis 세션을 특정하기 위한 식별자입니다.'),
+
+  storeId: z
+    .preprocess((val) => (val === undefined ? undefined : Number(val)), z.number().int().positive())
+    .optional()
+    .describe('특정 매장 ID. 제공 시 해당 매장 정보를 유지하며 조회합니다.'),
+
+  name: z
+    .string()
     .optional()
     .describe(
-      '사용자 ID. 제공 시 검색한 역(station)을 해당 사용자의 Redis 세션 preferred_station에 자동 저장합니다.',
+      'AI가 현재 대화 중인 매장의 정확한 이름. ' +
+        '세션의 last_store_name과 대조하여 매장 변경 여부를 판단합니다. ' +
+        '(storeName은 pg_trgm 퍼지 검색용, name은 세션 동기화용으로 구분됩니다.)',
     ),
 
   station: z
