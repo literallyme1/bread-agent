@@ -26,6 +26,17 @@ export type SessionPatchPayload = Partial<CurrentSession> & {
   preferred_station?: Profile['preferred_station'];
   taste_tags?: Profile['taste_tags'];
 };
+
+/**
+ * syncSearchContext에 전달되는 검색 컨텍스트.
+ * StoreQueryDto와 호환되는 구조이며, SessionService가 Store 모듈에 의존하지 않도록 별도 정의합니다.
+ */
+export interface SearchSyncContext {
+  userId: string;
+  storeId?: number;
+  station?: string;
+  preference?: string[];
+}
 import {
   getAllowedNextStatuses,
   isValidTransition,
@@ -220,5 +231,94 @@ export class SessionService {
     }
     await this.redisService.deleteSession(userId);
     this.logger.log(`[deleteSession] session deleted userId=${userId}`);
+  }
+
+  /**
+   * 매장 검색 시작 시 세션 상태를 서버 주도로 동기화합니다.
+   *
+   * [리셋 조건] — 아래 중 하나라도 해당하면 예약 진행 필드를 초기화하고 SEARCHING으로 복귀합니다.
+   *   1. 현재 세션 상태가 FAIL인 경우
+   *   2. ctx.storeId가 존재하는데 기존 last_store_id와 다른 경우 (상태 무관 방어적 리셋)
+   *   3. ctx.storeId 없이 새로운 역(station)으로 검색하는 경우
+   *
+   * 리셋은 patchCurrentSession을 직접 사용하여 상태 전이 검증을 우회합니다.
+   * 이는 서버가 방어적으로 강제 복귀시키는 예외 경로이므로 AI 상태 전이 규칙을 적용하지 않습니다.
+   *
+   * [프로필 동기화] — station → preferred_station, preference → taste_tags 자동 저장
+   *
+   * [자동 승격] — 리셋/프로필 업데이트 후 세션에 last_store_id, selected_items(≥1개), pickup_time이
+   *   모두 존재하고 현재 상태가 SEARCHING이면 READY_FOR_SUMMARY로 자동 전이합니다.
+   */
+  async syncSearchContext(ctx: SearchSyncContext): Promise<void> {
+    const { userId, storeId, station, preference } = ctx;
+
+    const session = await this.redisService.getSession(userId);
+    const current = session?.current_session;
+    const currentStatus = current?.status;
+
+    // ── 리셋 조건 판별 ─────────────────────────────────────────────────────────
+    const isFail = currentStatus === SessionStatus.FAIL;
+    const isDifferentStore =
+      storeId !== undefined && current?.last_store_id !== storeId;
+    const isNewStation =
+      storeId === undefined &&
+      station !== undefined &&
+      station !== session?.profile?.preferred_station;
+
+    const shouldReset = isFail || isDifferentStore || isNewStation;
+
+    if (shouldReset) {
+      const reasons: string[] = [];
+      if (isFail) reasons.push('FAIL status');
+      if (isDifferentStore)
+        reasons.push(`storeId changed (${current?.last_store_id} → ${storeId})`);
+      if (isNewStation)
+        reasons.push(`new station (${session?.profile?.preferred_station ?? 'none'} → ${station})`);
+
+      // 상태 전이 검증을 우회하여 방어적 강제 리셋 수행
+      await this.redisService.patchCurrentSession(userId, {
+        status: SessionStatus.SEARCHING,
+        selected_items: [],
+        pickup_time: undefined,
+        hold_token: undefined,
+        last_error: undefined,
+      });
+
+      this.logger.log(
+        `[syncSearchContext] userId=${userId} defensive reset: ${reasons.join(', ')}`,
+      );
+    }
+
+    // ── 프로필 동기화 ──────────────────────────────────────────────────────────
+    const profilePatch: { preferred_station?: string; taste_tags?: string[] } = {};
+    if (station) profilePatch.preferred_station = station;
+    if (preference && preference.length > 0) profilePatch.taste_tags = preference;
+
+    if (Object.keys(profilePatch).length > 0) {
+      await this.redisService.updateProfile(userId, profilePatch);
+      this.logger.log(
+        `[syncSearchContext] userId=${userId} profile synced` +
+          (profilePatch.preferred_station ? ` station=${profilePatch.preferred_station}` : '') +
+          (profilePatch.taste_tags ? ` taste_tags=${JSON.stringify(profilePatch.taste_tags)}` : ''),
+      );
+    }
+
+    // ── 자동 승격: SEARCHING → READY_FOR_SUMMARY ──────────────────────────────
+    // 필수 예약 정보가 모두 충족된 경우에만 수행. SEARCHING 상태일 때만 승격합니다.
+    const updated = await this.redisService.getSession(userId);
+    const cs = updated?.current_session;
+    if (
+      cs?.status === SessionStatus.SEARCHING &&
+      cs?.last_store_id !== undefined &&
+      (cs?.selected_items?.length ?? 0) >= 1 &&
+      cs?.pickup_time !== undefined
+    ) {
+      await this.redisService.patchCurrentSession(userId, {
+        status: SessionStatus.READY_FOR_SUMMARY,
+      });
+      this.logger.log(
+        `[syncSearchContext] userId=${userId} auto-promoted SEARCHING → READY_FOR_SUMMARY`,
+      );
+    }
   }
 }
