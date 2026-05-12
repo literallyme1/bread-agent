@@ -42,6 +42,9 @@ export type SessionPatchPayload = Partial<CurrentSession> & {
  */
 export interface SearchSyncContext {
   userId: string;
+  /** AI가 현재 대화 중인 매장의 정확한 이름. last_store_name 대조의 우선 신호. */
+  name?: string;
+  /** 매장 DB ID. name이 없을 때 보조 대조 신호로 사용. */
   storeId?: number;
   station?: string;
   preference?: string[];
@@ -338,57 +341,129 @@ export class SessionService {
   /**
    * 매장 검색 시작 시 세션 상태를 서버 주도로 동기화합니다.
    *
-   * [리셋 조건] — 아래 중 하나라도 해당하면 예약 진행 필드를 초기화하고 SEARCHING으로 복귀합니다.
-   *   1. 현재 세션 상태가 FAIL인 경우
-   *   2. ctx.storeId가 존재하는데 기존 last_store_id와 다른 경우 (상태 무관 방어적 리셋)
-   *   3. ctx.storeId 없이 새로운 역(station)으로 검색하는 경우
+   * ─ 최적화 선행 체크 ───────────────────────────────────────────────────────
+   * [Case A: SEARCHING 상태]
+   *   이미 검색 중인 세션이므로 리셋이 불필요합니다.
+   *   새로 들어온 검색 정보(name, storeId)만 세션에 덮어쓰고,
+   *   4가지 시나리오 판별을 건너뜁니다.
+   *   프로필 동기화 및 자동 승격은 이후 공통 처리에서 수행됩니다.
    *
-   * 리셋은 patchCurrentSession을 직접 사용하여 상태 전이 검증을 우회합니다.
-   * 이는 서버가 방어적으로 강제 복귀시키는 예외 경로이므로 AI 상태 전이 규칙을 적용하지 않습니다.
+   * ─ 4가지 시나리오 (status ≠ SEARCHING일 때만 진입) ──────────────────────
    *
-   * [프로필 동기화] — station → preferred_station, preference → taste_tags 자동 저장
+   * [시나리오 1: 새로운 검색]
+   *   name / storeId 없이 기존과 다른 station만 들어온 경우.
+   *   예약 정보 전체(매장·아이템·시간·토큰) 초기화 + status = SEARCHING.
    *
-   * [자동 승격] — 리셋/프로필 업데이트 후 세션에 last_store_id, selected_items(≥1개), pickup_time이
-   *   모두 존재하고 현재 상태가 SEARCHING이면 READY_FOR_SUMMARY로 자동 전이합니다.
+   * [시나리오 2: 매장 변경]
+   *   ctx.name이 존재하고 기존 last_store_name과 다른 경우 (name 우선).
+   *   또는 ctx.storeId가 기존 last_store_id와 다른 경우 (보조 신호).
+   *   장바구니·시간·토큰 초기화 + 새 매장 정보(name / storeId)로 업데이트.
+   *
+   * [시나리오 3: 실패 복구]
+   *   현재 status === FAIL인 경우. 묻지도 따지지도 않고 예약 진행 데이터 강제 리셋.
+   *   (last_store_id / last_store_name은 유지하여 AI가 재시도 맥락을 파악할 수 있게 함)
+   *
+   * [시나리오 4: 매장 유지]
+   *   name 또는 storeId가 기존 정보와 일치하면 아무것도 초기화하지 않습니다.
+   *   기존 장바구니와 픽업 시간을 그대로 유지합니다.
+   *
+   * ─ 공통 처리 ─────────────────────────────────────────────────────────────
+   * [프로필 동기화] station → preferred_station, preference → taste_tags
+   * [자동 승격]    last_store_id + selected_items(≥1) + pickup_time 모두 존재
+   *               하고 status === SEARCHING이면 READY_FOR_SUMMARY로 자동 전이.
+   *
+   * 리셋은 patchCurrentSession으로 상태 전이 검증을 우회합니다.
+   * 서버가 방어적으로 강제 복귀시키는 예외 경로이므로 AI 규칙을 적용하지 않습니다.
    */
   async syncSearchContext(ctx: SearchSyncContext): Promise<void> {
-    const { userId, storeId, station, preference } = ctx;
+    const { userId, name, storeId, station, preference } = ctx;
 
     const session = await this.redisService.getSession(userId);
     const current = session?.current_session;
     const currentStatus = current?.status;
 
-    // ── 리셋 조건 판별 ─────────────────────────────────────────────────────────
-    const isFail = currentStatus === SessionStatus.FAIL;
-    const isDifferentStore =
-      storeId !== undefined && current?.last_store_id !== storeId;
-    const isNewStation =
-      storeId === undefined &&
-      station !== undefined &&
-      station !== session?.profile?.preferred_station;
+    // ── 최적화 선행 체크: SEARCHING 상태면 리셋 없이 검색 정보만 덮어쓰기 ────────
+    if (currentStatus === SessionStatus.SEARCHING) {
+      const overwritePatch: Partial<import('../redis/session.schema').CurrentSession> = {};
+      if (name !== undefined) overwritePatch.last_store_name = name;
+      if (storeId !== undefined) overwritePatch.last_store_id = storeId;
 
-    const shouldReset = isFail || isDifferentStore || isNewStation;
-
-    if (shouldReset) {
-      const reasons: string[] = [];
-      if (isFail) reasons.push('FAIL status');
-      if (isDifferentStore)
-        reasons.push(`storeId changed (${current?.last_store_id} → ${storeId})`);
-      if (isNewStation)
-        reasons.push(`new station (${session?.profile?.preferred_station ?? 'none'} → ${station})`);
-
-      // 상태 전이 검증을 우회하여 방어적 강제 리셋 수행
-      await this.redisService.patchCurrentSession(userId, {
-        status: SessionStatus.SEARCHING,
-        selected_items: [],
-        pickup_time: undefined,
-        hold_token: undefined,
-        last_error: undefined,
-      });
+      if (Object.keys(overwritePatch).length > 0) {
+        await this.redisService.patchCurrentSession(userId, overwritePatch);
+      }
 
       this.logger.log(
-        `[syncSearchContext] userId=${userId} defensive reset: ${reasons.join(', ')}`,
+        `[syncSearchContext] userId=${userId} Case A — already SEARCHING, overwrite only` +
+          (name ? ` name="${name}"` : '') +
+          (storeId ? ` storeId=${storeId}` : ''),
       );
+    } else {
+      // ── 시나리오 판별 (status ≠ SEARCHING) ────────────────────────────────────
+
+      // [시나리오 3] FAIL — 무조건 리셋 (최우선)
+      const isFail = currentStatus === SessionStatus.FAIL;
+
+      // [시나리오 2] 매장 변경 — name 대조 우선, storeId 보조
+      const isNameMismatch =
+        !!name &&
+        !!current?.last_store_name &&
+        name !== current.last_store_name;
+
+      const isIdMismatch =
+        storeId !== undefined &&
+        current?.last_store_id !== undefined &&
+        storeId !== current.last_store_id;
+
+      const isStoreMismatch = isNameMismatch || isIdMismatch;
+
+      // [시나리오 1] 새로운 검색 — name/storeId 없이 새로운 station
+      const isNewSearch =
+        !name &&
+        !storeId &&
+        station !== undefined &&
+        station !== session?.profile?.preferred_station;
+
+      // [시나리오 4] 매장 유지 — 위 조건 중 아무것도 해당 없음
+
+      const shouldReset = isFail || isStoreMismatch || isNewSearch;
+
+      if (shouldReset) {
+        const reasons: string[] = [];
+        if (isFail) reasons.push('FAIL status');
+        if (isNameMismatch) reasons.push(`name changed ("${current?.last_store_name}" → "${name}")`);
+        if (isIdMismatch) reasons.push(`storeId changed (${current?.last_store_id} → ${storeId})`);
+        if (isNewSearch) reasons.push(`new station (${session?.profile?.preferred_station ?? 'none'} → ${station})`);
+
+        // 공통 리셋 필드 (예약 진행 데이터)
+        const resetPatch: Partial<import('../redis/session.schema').CurrentSession> = {
+          status: SessionStatus.SEARCHING,
+          selected_items: [],
+          pickup_time: undefined,
+          hold_token: undefined,
+          last_error: undefined,
+        };
+
+        if (isStoreMismatch) {
+          // 시나리오 2: 신규 매장 정보로 교체
+          resetPatch.last_store_name = name ?? undefined;
+          resetPatch.last_store_id = storeId;
+        } else if (isNewSearch) {
+          // 시나리오 1: 매장 정보까지 완전 초기화
+          resetPatch.last_store_id = undefined;
+          resetPatch.last_store_name = undefined;
+        }
+        // 시나리오 3 (FAIL): last_store_id / last_store_name 유지 (재시도 맥락 보존)
+
+        await this.redisService.patchCurrentSession(userId, resetPatch);
+        this.logger.log(
+          `[syncSearchContext] userId=${userId} reset [${reasons.join(' | ')}]`,
+        );
+      } else {
+        this.logger.log(
+          `[syncSearchContext] userId=${userId} scenario 4 — store retained` +
+            (current?.last_store_name ? ` store="${current.last_store_name}"` : ''),
+        );
+      }
     }
 
     // ── 프로필 동기화 ──────────────────────────────────────────────────────────

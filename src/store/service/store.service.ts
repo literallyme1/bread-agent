@@ -24,6 +24,7 @@ export class StoreService {
     // Server-Driven 세션 동기화: 리셋 판별 → 프로필 저장 → 자동 승격
     await this.sessionService.syncSearchContext({
       userId: query.userId,
+      name: query.name,
       storeId: query.storeId,
       station: query.station,
       preference: query.preference as string[] | undefined,
