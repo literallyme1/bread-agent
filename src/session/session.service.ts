@@ -10,6 +10,7 @@ import {
   Profile,
   RedisUserSession,
   RedisUserSessionSchema,
+  SelectedItem,
   SessionStatus,
   SessionStatusType,
 } from '../redis/session.schema';
@@ -19,12 +20,20 @@ import {
  *
  * - profile 필드(preferred_station, taste_tags): 최상위로 전달되며 서비스 내부에서 profile 객체에 병합됩니다.
  * - current_session 필드: 나머지 모든 CurrentSession 필드.
+ * - itemId + count: 단일 아이템의 최종 목표 수량을 지정합니다. selected_items 배열과 동시에 사용 불가.
+ *   count=0 이면 해당 아이템을 목록에서 제거합니다.
  *
  * AI가 단일 patchSession 호출로 profile과 current_session을 동시에 수정할 수 있습니다.
  */
 export type SessionPatchPayload = Partial<CurrentSession> & {
   preferred_station?: Profile['preferred_station'];
   taste_tags?: Profile['taste_tags'];
+  /** 수정할 아이템 ID. count와 함께 제공해야 합니다. */
+  itemId?: number;
+  /** 추가 시 필요한 아이템 이름. itemId가 목록에 없을 때 신규 항목으로 추가됩니다. */
+  itemName?: string;
+  /** 아이템의 최종 목표 수량(0 = 삭제). itemId와 함께 제공해야 합니다. */
+  count?: number;
 };
 
 /**
@@ -80,14 +89,18 @@ export class SessionService {
    * 처리 순서:
    *   1. Upsert: 세션 조회 → 없으면 기본 세션으로 초기화
    *   2. profile 필드(preferred_station, taste_tags) 분리 → profile 객체에 병합
-   *   3. 현재 상태가 READY_FOR_SUMMARY이고 정보 수집 필드가 수정되는 경우 status를 SEARCHING으로 자동 롤백
-   *   4. status 필드가 포함된 경우에만 상태 전이 규칙 검증 (신규 세션이면 모든 상태 허용)
-   *   5. 기존 세션에 병합 후 RedisUserSessionSchema.safeParse()로 최종 검증
-   *   6. Redis 저장
+   *   3. [STEP 1] itemId + count가 제공된 경우 — 기존 목록에서 해당 아이템 수량을 덮어씁니다.
+   *              count=0이면 목록에서 제거합니다. 결과가 patch.selected_items에 반영됩니다.
+   *   4. itemId 경로가 아닐 때만 — READY_FOR_SUMMARY에서 정보 수집 필드 수정 시 SEARCHING으로 롤백.
+   *   5. itemId 경로가 아닐 때만 — 명시적 status 전이 규칙 검증.
+   *   6. 기존 세션에 병합
+   *   7. [STEP 2] itemId 경로 한정 — 병합 후 selected_items가 비면 SEARCHING으로 강제 복귀.
+   *   8. [STEP 3] itemId 경로 한정 — 병합 후 필수 정보가 모두 충족되면 READY_FOR_SUMMARY로 자동 승격.
+   *   9. RedisUserSessionSchema.safeParse()로 최종 검증 후 Redis 저장
    */
   async patchSession(userId: string, payload: SessionPatchPayload): Promise<RedisUserSession> {
-    // Upsert: rawExisting이 null이면 신규 세션으로 간주.
-    // 신규 세션의 currentStatus는 SEARCHING으로 고정하여 상태 전이 검증이
+    // ── Upsert ───────────────────────────────────────────────────────────────────
+    // 신규 세션의 currentStatus를 SEARCHING으로 고정하여 상태 전이 검증이
     // SEARCHING을 출발점으로 올바르게 적용되도록 합니다.
     const rawExisting = await this.redisService.getSession(userId);
     const existing: RedisUserSession = rawExisting ?? {
@@ -101,10 +114,10 @@ export class SessionService {
       this.logger.log(`[patchSession] userId=${userId} session not found — auto-creating with SEARCHING defaults`);
     }
 
-    // profile 필드와 current_session 필드 분리
-    const { preferred_station, taste_tags, ...currentSessionPatch } = payload;
+    // ── 필드 분리 ─────────────────────────────────────────────────────────────────
+    const { preferred_station, taste_tags, itemId, itemName, count, ...currentSessionPatch } = payload;
 
-    // profile 병합 (제공된 필드만 덮어씀)
+    // ── Profile 병합 (제공된 필드만 덮어씀) ─────────────────────────────────────────
     const updatedProfile: RedisUserSession['profile'] =
       preferred_station !== undefined || taste_tags !== undefined
         ? ({
@@ -114,15 +127,32 @@ export class SessionService {
           } as Profile)
         : existing.profile;
 
-    // READY_FOR_SUMMARY 상태에서 정보 수집 필드가 수정되면 status를 SEARCHING으로 롤백.
-    // 단, patch에 status가 명시적으로 포함된 경우(= 에이전트가 의도적으로 전이를 지정한 경우)는 롤백하지 않음.
-    // 신규 세션(rawExisting === null)은 SEARCHING을 출발점으로 고정합니다.
+    // ── STEP 1: 아이템 단위 수량 덮어쓰기 ────────────────────────────────────────
+    // AI가 '최종 목표 수량(Desired State)'을 보내면 서버가 기존 목록에 반영합니다.
+    // count=0이면 해당 아이템을 제거합니다. selected_items와 동시에 사용 불가.
+    let itemUpdateApplied = false;
+    let patch = currentSessionPatch as Partial<CurrentSession>;
+
+    if (itemId !== undefined && count !== undefined) {
+      const existingItems = existing.current_session?.selected_items ?? [];
+      const resolvedItems = this.applyItemUpdate(existingItems, itemId, count, itemName, userId);
+      patch = { ...patch, selected_items: resolvedItems };
+      itemUpdateApplied = true;
+      this.logger.log(
+        `[patchSession] userId=${userId} item update: id=${itemId} count=${count}` +
+          ` → items.length=${resolvedItems.length}`,
+      );
+    }
+
+    // ── SUMMARY_INVALIDATING 롤백 (itemId 경로 제외) ─────────────────────────────
+    // itemId 경로는 STEP 2/3 자동 규칙이 상태를 관리하므로 롤백 생략.
     const currentStatus =
       rawExisting !== null
         ? rawExisting?.current_session?.status
         : SessionStatus.SEARCHING;
-    let patch = currentSessionPatch as Partial<CurrentSession>;
+
     if (
+      !itemUpdateApplied &&
       currentStatus === SessionStatus.READY_FOR_SUMMARY &&
       patch.status === undefined &&
       SUMMARY_INVALIDATING_FIELDS.some((field) => field in patch)
@@ -135,17 +165,53 @@ export class SessionService {
       );
     }
 
-    // status 필드가 포함된 경우에만 상태 전이 규칙 검증
-    if (patch.status !== undefined) {
+    // ── 명시적 status 전이 검증 (itemId 경로 제외) ────────────────────────────────
+    // itemId 경로는 STEP 2/3 자동 규칙이 최종 상태를 결정합니다.
+    if (!itemUpdateApplied && patch.status !== undefined) {
       this.validateTransition(currentStatus, patch.status, userId);
     }
 
+    // ── 병합 ──────────────────────────────────────────────────────────────────────
+    let mergedSession: CurrentSession = {
+      ...existing.current_session,
+      ...patch,
+    } as CurrentSession;
+
+    // ── STEP 2: Fallback — 아이템이 비면 SEARCHING으로 강제 복귀 ─────────────────
+    // 아이템 업데이트 결과 selected_items가 빈 배열이 되면 예약 진행이 불가능합니다.
+    // 이 복귀는 상태 전이 검증을 우회하는 서버 주도 방어 로직입니다.
+    if (itemUpdateApplied && (mergedSession.selected_items?.length ?? 0) === 0) {
+      mergedSession = {
+        ...mergedSession,
+        status: SessionStatus.SEARCHING,
+        pickup_time: undefined,
+        hold_token: undefined,
+      };
+      this.logger.log(
+        `[patchSession] userId=${userId} auto-fallback: SEARCHING (selected_items empty)`,
+      );
+    }
+
+    // ── STEP 3: Promotion — 필수 예약 정보 완비 시 READY_FOR_SUMMARY 자동 승격 ────
+    // SEARCHING 상태에서 last_store_id + selected_items(≥1) + pickup_time이 모두
+    // 충족되면 AI 호출 없이 서버가 직접 READY_FOR_SUMMARY로 전이합니다.
+    else if (
+      itemUpdateApplied &&
+      mergedSession.status === SessionStatus.SEARCHING &&
+      mergedSession.last_store_id !== undefined &&
+      (mergedSession.selected_items?.length ?? 0) >= 1 &&
+      mergedSession.pickup_time !== undefined
+    ) {
+      mergedSession = { ...mergedSession, status: SessionStatus.READY_FOR_SUMMARY };
+      this.logger.log(
+        `[patchSession] userId=${userId} auto-promoted: SEARCHING → READY_FOR_SUMMARY`,
+      );
+    }
+
+    // ── Schema 검증 + 저장 ────────────────────────────────────────────────────────
     const updated: RedisUserSession = {
       profile: updatedProfile,
-      current_session: {
-        ...existing.current_session,
-        ...patch,
-      } as CurrentSession,
+      current_session: mergedSession,
     };
 
     const validated = RedisUserSessionSchema.safeParse(updated);
@@ -158,10 +224,46 @@ export class SessionService {
 
     await this.redisService.setSession(userId, validated.data);
     this.logger.log(
-      `[patchSession] userId=${userId} patched fields=[${Object.keys(payload).join(', ')}]`,
+      `[patchSession] userId=${userId} saved fields=[${Object.keys(payload).join(', ')}]` +
+        ` status=${validated.data.current_session?.status}`,
     );
 
     return validated.data;
+  }
+
+  /**
+   * 기존 selected_items 목록에 단일 아이템 업데이트를 적용합니다.
+   *
+   * - count > 0 + 아이템 존재: 수량을 count로 덮어씁니다.
+   * - count > 0 + 아이템 없음: itemName이 있으면 신규 추가, 없으면 목록 유지 후 경고 로그.
+   * - count === 0: 해당 아이템을 목록에서 제거합니다.
+   */
+  private applyItemUpdate(
+    items: SelectedItem[],
+    itemId: number,
+    count: number,
+    itemName: string | undefined,
+    userId: string,
+  ): SelectedItem[] {
+    if (count === 0) {
+      return items.filter((item) => item.id !== itemId);
+    }
+
+    const existingIndex = items.findIndex((item) => item.id === itemId);
+
+    if (existingIndex >= 0) {
+      return items.map((item) => (item.id === itemId ? { ...item, count } : item));
+    }
+
+    // 목록에 없는 신규 아이템: itemName 필수
+    if (!itemName) {
+      this.logger.warn(
+        `[applyItemUpdate] userId=${userId} itemId=${itemId} not in list and itemName missing — skipped`,
+      );
+      return items;
+    }
+
+    return [...items, { id: itemId, name: itemName, count }];
   }
 
   /**
