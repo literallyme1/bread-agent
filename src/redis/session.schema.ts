@@ -66,16 +66,21 @@ export type SelectedItem = z.infer<typeof SelectedItemSchema>;
 
 /**
  * 사용자 선호 프로필 스키마.
- * preferred_station은 특정 역명을 강제하지 않아 동적으로 관리됩니다.
+ *
+ * getStores의 updateProfile은 역·태그를 따로 덮어쓸 수 있어 Redis에는
+ * `preferred_station`만 있거나 `taste_tags`만 있는 등 부분 객체가 저장될 수 있습니다.
+ * 두 필드는 모두 optional로 두어 세션 저장/조회 시 Zod 검증이 깨지지 않게 합니다.
  */
 export const ProfileSchema = z.object({
   preferred_station: z
     .string()
+    .optional()
     .describe(
       '사용자 선호 지역(역명). 특정 역명을 강제하지 않으며 동적으로 관리됩니다. (예: "신중동역", "강남역")',
     ),
   taste_tags: z
     .array(z.string())
+    .optional()
     .describe('취향 태그 배열. (예: ["달지않음", "건강빵"])'),
 });
 export type Profile = z.infer<typeof ProfileSchema>;
