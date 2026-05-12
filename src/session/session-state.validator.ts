@@ -7,8 +7,7 @@ import { SessionStatus, SessionStatusType } from '../redis/session.schema';
  * │ Current                           │ Allowed Next                                  │
  * ├───────────────────────────────────┼───────────────────────────────────────────────┤
  * │ SEARCHING                         │ READY_FOR_SUMMARY                             │
- * │ READY_FOR_SUMMARY                 │ PRE_HOLD_CONFIRM, SEARCHING                   │
- * │ PRE_HOLD_CONFIRM                  │ WAITING_FOR_CONFIRM, FAIL                     │
+ * │ READY_FOR_SUMMARY                 │ WAITING_FOR_CONFIRM, SEARCHING                │
  * │ WAITING_FOR_CONFIRM               │ COMPLETED, EXPIRED                            │
  * │ COMPLETED                         │ WAITING_FOR_CANCELLING_CONFIRM, SEARCHING     │
  * │ WAITING_FOR_CANCELLING_CONFIRM    │ CANCELLED, SEARCHING                          │
@@ -21,13 +20,8 @@ const ALLOWED_TRANSITIONS: Readonly<Record<SessionStatusType, readonly SessionSt
   [SessionStatus.SEARCHING]: [SessionStatus.READY_FOR_SUMMARY],
 
   [SessionStatus.READY_FOR_SUMMARY]: [
-    SessionStatus.PRE_HOLD_CONFIRM,
-    SessionStatus.SEARCHING,
-  ],
-
-  [SessionStatus.PRE_HOLD_CONFIRM]: [
     SessionStatus.WAITING_FOR_CONFIRM,
-    SessionStatus.FAIL,
+    SessionStatus.SEARCHING,
   ],
 
   [SessionStatus.WAITING_FOR_CONFIRM]: [

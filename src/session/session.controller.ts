@@ -55,7 +55,6 @@ const PatchSessionSchema = z.object({
     '변경할 예약 상태:\n' +
       '  SEARCHING                      - 예약 정보를 수집 중인 초기 탐색 상태\n' +
       '  READY_FOR_SUMMARY              - 모든 정보 수집 완료 후 최종 요약을 보여주고 사용자 승인을 기다리는 상태\n' +
-      '  PRE_HOLD_CONFIRM               - 요약 승인 후 실제 hold 점유를 시도하기 직전의 상태\n' +
       '  WAITING_FOR_CONFIRM            - holdReservation 성공(전 아이템 hold) 후 2분 내 확정 대기\n' +
       '  WAITING_FOR_CANCELLING_CONFIRM - 취소 요청 후 수수료 고지, 사용자 최종 동의 대기\n' +
       '  COMPLETED                      - 예약이 성공적으로 확정된 상태\n' +
@@ -74,7 +73,6 @@ const SESSION_STATUS_SCHEMA = {
   enum: [
     'SEARCHING',
     'READY_FOR_SUMMARY',
-    'PRE_HOLD_CONFIRM',
     'WAITING_FOR_CONFIRM',
     'WAITING_FOR_CANCELLING_CONFIRM',
     'COMPLETED',
@@ -87,7 +85,6 @@ const SESSION_STATUS_SCHEMA = {
     'Redis 세션 예약 상태 (DB ReservationStatus와 분리된 세션 전용 상태값):\n' +
     '  SEARCHING - 예약 정보를 수집 중인 초기 탐색 상태\n' +
     '  READY_FOR_SUMMARY - 모든 정보 수집 완료 후 최종 요약을 보여주고 사용자 승인을 기다리는 상태\n' +
-    '  PRE_HOLD_CONFIRM - 요약 승인 후 실제 hold 점유를 시도하기 직전의 상태\n' +
     '  WAITING_FOR_CONFIRM - holdReservation 성공 후 2분 내 최종 확정 대기\n' +
     '  WAITING_FOR_CANCELLING_CONFIRM - 취소 요청 후 수수료 고지, 사용자 최종 동의 대기\n' +
     '  COMPLETED - 예약이 성공적으로 확정된 상태\n' +
@@ -265,7 +262,7 @@ export class SessionController {
             selected_items: [{ id: 101, name: '소금빵', count: 2 }],
             pickup_time: '2026-05-09T20:00:00',
             hold_token: 'h-8291-abc-xyz',
-            status: 'PRE_HOLD_CONFIRM',
+            status: 'WAITING_FOR_CONFIRM',
             last_error: null,
           },
         },

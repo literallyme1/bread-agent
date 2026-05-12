@@ -251,8 +251,7 @@ AI는 서버 응답의 current_session 상태를 그대로 신뢰한다.
 AI가 직접 patch 가능한 상태는:
 
 * READY_FOR_SUMMARY
-* PRE_HOLD_CONFIRM
-* SERCHING
+* SEARCHING
 * WAITING_FOR_CANCELLING_CONFIRM
 
 뿐이다.

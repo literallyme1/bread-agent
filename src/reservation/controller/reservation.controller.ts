@@ -45,7 +45,7 @@ export class ReservationController {
       '- 요청한 모든 아이템의 재고가 충분할 때만 holdToken을 발급하고 Redis에 Hold를 생성합니다.\n' +
       '- 단 하나라도 재고 부족이면 Redis Hold를 생성하지 않고 `success: false`와 상세 실패 목록을 반환합니다.\n\n' +
       '**세션 상태 전이**\n' +
-      '- 성공: `PRE_HOLD_CONFIRM → WAITING_FOR_CONFIRM` (hold_token 함께 저장)\n' +
+      '- 성공: `READY_FOR_SUMMARY → WAITING_FOR_CONFIRM` (hold_token 함께 저장)\n' +
       '- 실패: 현재 상태 → `FAIL` (last_error에 실패 사유 기록)\n\n' +
       '실제 재고 차감은 `/confirm` 단계에서만 수행됩니다.',
   })
