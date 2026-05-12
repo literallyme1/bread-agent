@@ -1,6 +1,7 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { StoreService } from './store.service';
 import { StoreRepository } from '../repository/store.repository';
+import { SessionService } from '../../session/session.service';
 import { StoreQueryDto } from '../dto/store-query.dto';
 import { CustomException } from '../../common/exception/custom.exception';
 import { ErrorCode } from '../../common/exception/error-code.enum';
@@ -11,6 +12,7 @@ import { Station } from '../../common/enums/station.enum';
 describe('StoreService', () => {
   let service: StoreService;
   let storeRepository: jest.Mocked<StoreRepository>;
+  let sessionService: jest.Mocked<Pick<SessionService, 'syncSearchContext'>>;
 
   beforeEach(async () => {
     storeRepository = {
@@ -18,10 +20,15 @@ describe('StoreService', () => {
       findById: jest.fn(),
     } as any;
 
+    sessionService = {
+      syncSearchContext: jest.fn().mockResolvedValue(undefined),
+    };
+
     const module: TestingModule = await Test.createTestingModule({
       providers: [
         StoreService,
         { provide: StoreRepository, useValue: storeRepository },
+        { provide: SessionService, useValue: sessionService },
       ],
     }).compile();
 
@@ -50,7 +57,7 @@ describe('StoreService', () => {
       ];
       storeRepository.findStoresWithBreads.mockResolvedValue(rawRows);
 
-      const query: StoreQueryDto = { station: Station.DAEJEON };
+      const query: StoreQueryDto = { userId: 'user-1', station: Station.DAEJEON };
       const result = await service.getStores(query);
 
       expect(result.stores).toHaveLength(1);
@@ -85,14 +92,14 @@ describe('StoreService', () => {
       ];
       storeRepository.findStoresWithBreads.mockResolvedValue(rawRows);
 
-      const result = await service.getStores({ station: Station.DAEJEON });
+      const result = await service.getStores({ userId: 'user-1', station: Station.DAEJEON });
       expect(result.stores[0].breads[0].preferences).toEqual([]);
     });
 
     it('결과가 없으면 빈 stores 배열 반환', async () => {
       storeRepository.findStoresWithBreads.mockResolvedValue([]);
 
-      const result = await service.getStores({ station: '없는역' as Station });
+      const result = await service.getStores({ userId: 'user-1', station: '없는역' as Station });
       expect(result.stores).toHaveLength(0);
     });
 
@@ -115,7 +122,7 @@ describe('StoreService', () => {
       ];
       storeRepository.findStoresWithBreads.mockResolvedValue(rawRows);
 
-      const result = await service.getStores({ station: Station.DAEJEON });
+      const result = await service.getStores({ userId: 'user-1', station: Station.DAEJEON });
       expect(result.stores[0].breads).toHaveLength(0);
     });
 
@@ -152,7 +159,7 @@ describe('StoreService', () => {
       ];
       storeRepository.findStoresWithBreads.mockResolvedValue(rawRows);
 
-      const result = await service.getStores({ station: Station.DAEJEON });
+      const result = await service.getStores({ userId: 'user-1', station: Station.DAEJEON });
 
       expect(result.stores).toHaveLength(2);
       expect(result.stores[0].name).toBe('성심당');
@@ -166,7 +173,7 @@ describe('StoreService', () => {
     it('storeName 전달 시 repository에 query 그대로 위임', async () => {
       storeRepository.findStoresWithBreads.mockResolvedValue([]);
 
-      await service.getStores({ station: Station.DAEJEON, storeName: '하래하래' });
+      await service.getStores({ userId: 'user-1', station: Station.DAEJEON, storeName: '하래하래' });
 
       expect(storeRepository.findStoresWithBreads).toHaveBeenCalledWith(
         expect.objectContaining({ storeName: '하래하래' }),
@@ -176,7 +183,7 @@ describe('StoreService', () => {
     it('breadName 전달 시 repository에 query 그대로 위임 (오타 보완 대상)', async () => {
       storeRepository.findStoresWithBreads.mockResolvedValue([]);
 
-      await service.getStores({ station: Station.DAEJEON, breadName: '소금빵집' });
+      await service.getStores({ userId: 'user-1', station: Station.DAEJEON, breadName: '소금빵집' });
 
       expect(storeRepository.findStoresWithBreads).toHaveBeenCalledWith(
         expect.objectContaining({ breadName: '소금빵집' }),
@@ -187,6 +194,7 @@ describe('StoreService', () => {
       storeRepository.findStoresWithBreads.mockResolvedValue([]);
 
       await service.getStores({
+        userId: 'user-1',
         station: Station.DAEJEON,
         preference: [Preference.SALTY, Preference.CRISPY],
       });
