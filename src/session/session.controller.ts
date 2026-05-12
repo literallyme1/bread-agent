@@ -34,35 +34,76 @@ import { z } from 'zod';
  * profile 필드(preferred_station, taste_tags)와 current_session 필드를 하나의 요청으로 함께 수정할 수 있습니다.
  * 전달된 필드만 기존 세션에 병합되며, 나머지 필드는 그대로 유지됩니다.
  * 세션이 없으면 기본값(SEARCHING)으로 자동 생성 후 병합합니다(Upsert).
+ *
+ * [아이템 단위 수정 — itemId + count]
+ *   selected_items 배열 전체를 보내는 대신 특정 아이템 ID와 최종 목표 수량(count)을 지정합니다.
+ *   count=0이면 해당 아이템을 목록에서 제거합니다.
+ *   selected_items와 동시에 사용할 수 없습니다.
+ *
+ * [서버 자동 규칙 — itemId + count 사용 시]
+ *   - 수정 결과 selected_items가 비면: status 자동 → SEARCHING, pickup_time/hold_token 초기화
+ *   - 수정 결과 last_store_id + selected_items(≥1) + pickup_time 모두 존재 + 상태 SEARCHING이면:
+ *     status 자동 → READY_FOR_SUMMARY
  */
-const PatchSessionSchema = z.object({
-  // ── profile 필드 ────────────────────────────────────────────────────────────
-  preferred_station: ProfileSchema.shape.preferred_station.optional().describe(
-    '사용자 선호 지역(역명). profile.preferred_station에 저장됩니다. (예: "신중동역")',
-  ),
-  taste_tags: ProfileSchema.shape.taste_tags.optional().describe(
-    '취향 태그 배열. profile.taste_tags에 저장됩니다. (예: ["달지않음", "건강빵"])',
-  ),
-  // ── current_session 필드 ────────────────────────────────────────────────────
-  last_store_id: CurrentSessionSchema.shape.last_store_id,
-  last_store_name: CurrentSessionSchema.shape.last_store_name,
-  selected_items: z.array(SelectedItemSchema).optional().describe(
-    '선택한 아이템 목록. 각 요소: { id: number, name: string, count: number }',
-  ),
-  pickup_time: CurrentSessionSchema.shape.pickup_time,
-  hold_token: CurrentSessionSchema.shape.hold_token,
-  status: SessionStatusZodSchema.optional().describe(
-    '변경할 예약 상태:\n' +
-      '  SEARCHING                      - 예약 정보를 수집 중인 초기 탐색 상태\n' +
-      '  READY_FOR_SUMMARY              - 모든 정보 수집 완료 후 최종 요약을 보여주고 사용자 승인을 기다리는 상태\n' +
-      '  WAITING_FOR_CONFIRM            - holdReservation 성공(전 아이템 hold) 후 2분 내 확정 대기\n' +
-      '  WAITING_FOR_CANCELLING_CONFIRM - 취소 요청 후 수수료 고지, 사용자 최종 동의 대기\n' +
-      '  COMPLETED                      - 예약이 성공적으로 확정된 상태\n' +
-      '  CANCELLED                      - 예약 취소가 완료된 상태\n' +
-      '  FAIL                           - 재고 부족 또는 시스템 오류로 중단된 상태\n' +
-      '  EXPIRED                        - Hold TTL 만료로 예약 진행 불가',
-  ),
-});
+const PatchSessionSchema = z
+  .object({
+    // ── profile 필드 ──────────────────────────────────────────────────────────
+    preferred_station: ProfileSchema.shape.preferred_station.optional().describe(
+      '사용자 선호 지역(역명). profile.preferred_station에 저장됩니다. (예: "신중동역")',
+    ),
+    taste_tags: ProfileSchema.shape.taste_tags.optional().describe(
+      '취향 태그 배열. profile.taste_tags에 저장됩니다. (예: ["달지않음", "건강빵"])',
+    ),
+    // ── current_session 필드 ──────────────────────────────────────────────────
+    last_store_id: CurrentSessionSchema.shape.last_store_id,
+    last_store_name: CurrentSessionSchema.shape.last_store_name,
+    selected_items: z.array(SelectedItemSchema).optional().describe(
+      '아이템 목록 전체 교체. itemId와 동시 사용 불가. 각 요소: { id, name, count }',
+    ),
+    pickup_time: CurrentSessionSchema.shape.pickup_time,
+    hold_token: CurrentSessionSchema.shape.hold_token,
+    status: SessionStatusZodSchema.optional().describe(
+      '변경할 예약 상태:\n' +
+        '  SEARCHING                      - 예약 정보를 수집 중인 초기 탐색 상태\n' +
+        '  READY_FOR_SUMMARY              - 모든 정보 수집 완료 후 최종 요약을 보여주고 사용자 승인을 기다리는 상태\n' +
+        '  WAITING_FOR_CONFIRM            - holdReservation 성공(전 아이템 hold) 후 2분 내 확정 대기\n' +
+        '  WAITING_FOR_CANCELLING_CONFIRM - 취소 요청 후 수수료 고지, 사용자 최종 동의 대기\n' +
+        '  COMPLETED                      - 예약이 성공적으로 확정된 상태\n' +
+        '  CANCELLED                      - 예약 취소가 완료된 상태\n' +
+        '  FAIL                           - 재고 부족 또는 시스템 오류로 중단된 상태\n' +
+        '  EXPIRED                        - Hold TTL 만료로 예약 진행 불가\n' +
+        '  ※ itemId + count 사용 시 서버 자동 규칙이 최종 상태를 결정합니다.',
+    ),
+    // ── 아이템 단위 수정 필드 ──────────────────────────────────────────────────
+    itemId: z
+      .number()
+      .int()
+      .positive()
+      .optional()
+      .describe(
+        '수정할 아이템 ID. count와 함께 제공해야 합니다. selected_items와 동시 사용 불가.',
+      ),
+    itemName: z
+      .string()
+      .optional()
+      .describe(
+        '추가할 아이템 이름. itemId에 해당하는 아이템이 목록에 없을 때 신규 추가에 사용됩니다.',
+      ),
+    count: z
+      .number()
+      .int()
+      .min(0)
+      .optional()
+      .describe('아이템의 최종 목표 수량. 0이면 해당 아이템을 목록에서 제거합니다. itemId와 함께 제공해야 합니다.'),
+  })
+  .refine(
+    (data) => !(data.itemId !== undefined && data.selected_items !== undefined),
+    { message: 'itemId와 selected_items는 동시에 사용할 수 없습니다.' },
+  )
+  .refine(
+    (data) => (data.itemId === undefined) === (data.count === undefined),
+    { message: 'itemId와 count는 반드시 함께 제공해야 합니다.' },
+  );
 
 class PatchSessionDto extends createZodDto(PatchSessionSchema) {}
 
