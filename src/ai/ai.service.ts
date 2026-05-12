@@ -64,7 +64,18 @@ export class AiService implements OnModuleInit, OnApplicationShutdown {
       );
 
       if (swaggerDoc) {
-        this.toolset = new OpenApiToolset(swaggerDoc, baseUrl);
+        // AI가 호출하면 안 되거나 지침에 없는 도구를 명시적으로 제외합니다.
+        // - deleteSession : 사용자 세션을 완전 삭제 → 실수 호출 시 치명적
+        // - aiChat        : AI가 자기 자신을 재귀 호출하는 순환 위험
+        // - findStore     : 단건 매장 조회, 지침에 없음 (getStores로 대체)
+        // - findReservation: 단건 예약 조회, 지침에 없음 (listReservations로 대체)
+        const excludedTools = new Set([
+          'deleteSession',
+          'aiChat',
+          'findStore',
+          'findReservation',
+        ]);
+        this.toolset = new OpenApiToolset(swaggerDoc, baseUrl, excludedTools);
         this.logger.log(
           `OpenApiToolset created: ${this.toolset.toolCount} tool(s) from swagger-spec.json`,
         );
@@ -78,7 +89,7 @@ export class AiService implements OnModuleInit, OnApplicationShutdown {
       const agent = new LlmAgent({
         name: 'bread_path_agent',
         description: 'Bread-Path 빵 예약 AI 에이전트',
-        model: 'gemini-3.1-flash-lite',
+        model: 'gemini-2.5-flash',
         instruction: systemInstruction,
         tools: this.toolset ? [this.toolset] : [],
       });
@@ -162,32 +173,28 @@ export class AiService implements OnModuleInit, OnApplicationShutdown {
 
     const lines = [
       '■ [SYSTEM CONTEXT] ■',
-      '아래는 현재 대화 중인 사용자의 Redis 세션 스냅샷입니다.',
-      '각 필드명은 patchSession 도구의 파라미터명과 정확히 일치합니다.',
+      '아래는 현재 대화 중인 사용자의 실시간 Redis 세션 스냅샷입니다.',
+      '서버가 비즈니스 로직(상태 전환, 수량 계산 등)을 직접 처리하므로, 도구 응답의 status를 확인하십시오.',
       '',
-      `현재 시각          : ${currentTimeKst}`,
+      `현재 시각 (KST)      : ${currentTimeKst}`,
       '',
       '# 사용자 식별',
-      `userId            : ${userId}`,
+      `userId             : ${userId}`,
       '',
-      '# profile (사용자 선호 설정)',
-      `preferred_station : ${preferred_station ?? '(미설정)'}`,
-      `taste_tags        : ${taste_tags.length > 0 ? JSON.stringify(taste_tags) : '[]'}`,
+      '# profile (기본 선호도)',
+      `preferred_station  : ${preferred_station ?? '(미설정)'}`,
+      `taste_tags         : ${taste_tags.length > 0 ? JSON.stringify(taste_tags) : '[]'}`,
       '',
-      '# current_session (예약 진행 상태)',
-      `status            : ${status}`,
-      `last_store_id     : ${last_store_id ?? '(없음)'}`,
-      `last_store_name   : ${last_store_name ?? '(없음)'}`,
-      `selected_items    : ${JSON.stringify(selected_items)}`,
-      `pickup_time       : ${pickup_time ? `${pickup_time} KST` : '(미설정)'}`,
-      `hold_token        : ${hold_token ?? '(없음)'}`,
-      `last_error        : ${last_error ?? '(없음)'}`,
+      '# current_session (서버 주도 상태 관리)',
+      `status             : ${status}`,
+      `last_store_id      : ${last_store_id ?? '(없음)'}`,
+      `last_store_name    : ${last_store_name ?? '(없음)'}`,
+      `selected_items     : ${JSON.stringify(selected_items)}`,
+      `pickup_time        : ${pickup_time ? `${pickup_time} KST` : '(미설정)'}`,
+      `hold_token         : ${hold_token ?? '(없음)'}`,
+      `last_error         : ${last_error ?? '(없음)'}`,
       '',
-      '■ [지침] ■',
-      `· 모든 도구 호출 시 userId 파라미터는 반드시 ${userId}(으)로 고정하라.`,
-      '· 유저의 정보(매장·빵·시간 등)가 변경되면 즉시 patchSession 도구를 호출하여 Redis를 동기화하라.',
-      '· patchSession 호출 시 위 필드명(snake_case)을 그대로 파라미터 키로 사용하라.',
-      '· last_error가 null이 아닌 경우, 그 내용을 유저에게 친절히 설명하고 재시도 방법을 안내하라.',
+      `※ 모든 tool 호출 시 userId는 반드시 '${userId}'로 고정한다.`,
     ];
 
     return lines.join('\n');
@@ -204,19 +211,35 @@ export class AiService implements OnModuleInit, OnApplicationShutdown {
   /**
    * ADK 이벤트 스트림을 처리하여 최종 응답 텍스트를 반환합니다.
    * - 도구 호출/응답 이벤트는 피드백 루프를 위해 로깅됩니다.
-   * - isFinalResponse 이벤트가 감지되면 해당 텍스트를 반환합니다.
+   * - isFinalResponse는 "도구 호출/응답이 이 이벤트에 없음" 수준이라, 빈 텍스트인
+   *   최종 이벤트가 먼저 오고 이후에 patchSession 등 추가 라운드가 이어질 수 있습니다.
+   *   첫 빈 최종에서 break 하면 스트림을 잘라 reply가 ""가 되므로, 스트림을 끝까지
+   *   읽고 마지막 의미 있는(공백 아닌) 최종 텍스트를 사용합니다.
    */
   private async processEventStream(
     stream: AsyncIterable<unknown>,
     userId: string,
   ): Promise<string> {
-    let finalText = '';
+    let lastFinalText = '';
+    let lastNonEmptyFinalText = '';
 
     for await (const raw of stream) {
       const event = raw as Event;
 
-      // 도구 호출 파트 — AI가 어떤 도구를 호출했는지 기록 (피드백 루프 관찰)
+      // 모든 이벤트 요약 — 스트림 흐름 파악용
       const calls = getFunctionCalls(event);
+      const responses = getFunctionResponses(event);
+      const isFinal = isFinalResponse(event);
+      const text = stringifyContent(event);
+      this.logger.debug(
+        `[event] userId=${userId} author=${event.author} ` +
+        `calls=${calls.map(c => c.name).join(',')||'-'} ` +
+        `responses=${responses.map(r => r.name).join(',')||'-'} ` +
+        `isFinal=${isFinal} partial=${(event as Event & { partial?: boolean }).partial ?? false} ` +
+        `textLen=${text.length}`,
+      );
+
+      // 도구 호출 파트 — AI가 어떤 도구를 호출했는지 기록 (피드백 루프 관찰)
       if (calls.length > 0) {
         for (const call of calls) {
           this.logger.log(
@@ -226,7 +249,6 @@ export class AiService implements OnModuleInit, OnApplicationShutdown {
       }
 
       // 도구 응답 파트 — 도구 실행 결과가 AI에게 피드백되었음을 기록
-      const responses = getFunctionResponses(event);
       if (responses.length > 0) {
         for (const resp of responses) {
           this.logger.log(
@@ -235,14 +257,15 @@ export class AiService implements OnModuleInit, OnApplicationShutdown {
         }
       }
 
-      // 최종 응답 이벤트
-      if (isFinalResponse(event)) {
-        finalText = stringifyContent(event);
-        break;
+      if (isFinal) {
+        lastFinalText = text;
+        if (text.trim()) {
+          lastNonEmptyFinalText = text;
+        }
       }
     }
 
-    return finalText;
+    return lastNonEmptyFinalText || lastFinalText;
   }
 
   /**

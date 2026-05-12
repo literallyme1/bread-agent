@@ -10,8 +10,6 @@ export const SessionStatus = {
   SEARCHING: 'SEARCHING',
   /** 모든 정보 수집이 완료되어 사용자에게 최종 요약을 보여주고 승인을 기다리는 상태 */
   READY_FOR_SUMMARY: 'READY_FOR_SUMMARY',
-  /** 요약 승인 후 실제 hold 점유를 시도하기 직전의 상태 */
-  PRE_HOLD_CONFIRM: 'PRE_HOLD_CONFIRM',
   /** holdReservation 성공 후, 2분 내에 최종 확정을 기다리는 상태 */
   WAITING_FOR_CONFIRM: 'WAITING_FOR_CONFIRM',
   /** 취소 요청 시 수수료 고지 후 사용자의 최종 동의를 기다리는 상태 */
@@ -36,7 +34,6 @@ export const SessionStatusZodSchema = z
   .enum([
     'SEARCHING',
     'READY_FOR_SUMMARY',
-    'PRE_HOLD_CONFIRM',
     'WAITING_FOR_CONFIRM',
     'WAITING_FOR_CANCELLING_CONFIRM',
     'COMPLETED',
@@ -48,7 +45,6 @@ export const SessionStatusZodSchema = z
     'Redis 세션 예약 상태:\n' +
       '  SEARCHING - 예약 정보를 수집 중인 초기 탐색 상태\n' +
       '  READY_FOR_SUMMARY - 모든 정보 수집 완료 후 최종 요약을 보여주고 사용자 승인을 기다리는 상태\n' +
-      '  PRE_HOLD_CONFIRM - 요약 승인 후 실제 hold 점유를 시도하기 직전의 상태\n' +
       '  WAITING_FOR_CONFIRM - holdReservation 성공 후 2분 내 최종 확정 대기\n' +
       '  WAITING_FOR_CANCELLING_CONFIRM - 취소 요청 후 수수료 고지, 사용자 최종 동의 대기\n' +
       '  COMPLETED - 예약이 성공적으로 확정된 상태\n' +
@@ -70,16 +66,21 @@ export type SelectedItem = z.infer<typeof SelectedItemSchema>;
 
 /**
  * 사용자 선호 프로필 스키마.
- * preferred_station은 특정 역명을 강제하지 않아 동적으로 관리됩니다.
+ *
+ * getStores의 updateProfile은 역·태그를 따로 덮어쓸 수 있어 Redis에는
+ * `preferred_station`만 있거나 `taste_tags`만 있는 등 부분 객체가 저장될 수 있습니다.
+ * 두 필드는 모두 optional로 두어 세션 저장/조회 시 Zod 검증이 깨지지 않게 합니다.
  */
 export const ProfileSchema = z.object({
   preferred_station: z
     .string()
+    .optional()
     .describe(
       '사용자 선호 지역(역명). 특정 역명을 강제하지 않으며 동적으로 관리됩니다. (예: "신중동역", "강남역")',
     ),
   taste_tags: z
     .array(z.string())
+    .optional()
     .describe('취향 태그 배열. (예: ["달지않음", "건강빵"])'),
 });
 export type Profile = z.infer<typeof ProfileSchema>;

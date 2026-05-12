@@ -1,4 +1,4 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { BadRequestException, Injectable, Logger } from '@nestjs/common';
 import { DataSource } from 'typeorm';
 import { randomUUID } from 'crypto';
 import { ReservationRepository } from '../repository/reservation.repository';
@@ -6,40 +6,26 @@ import { InventoryRepository } from '../../inventory/repository/inventory.reposi
 import { StoreRepository } from '../../store/repository/store.repository';
 import { RedisHoldService, HoldData, HOLD_TTL_SECONDS } from '../../redis/redis.service';
 import { SessionStatus } from '../../redis/session.schema';
-import { CreateHoldDto } from '../dto/create-reservation.dto';
 import { ConfirmHoldDto } from '../dto/confirm-hold.dto';
 import { CancelReservationDto } from '../dto/cancel-reservation.dto';
 import { HoldResponseDto, HoldItemResultDto } from '../dto/hold-response.dto';
 import {
+  ConfirmReservationResponseDto,
   ReservationResponseDto,
   CancelReservationResponseDto,
 } from '../dto/reservation-response.dto';
-import {
-  ReservationListEntry,
-  toReservationListEntry,
-} from '../dto/reservation-list.dto';
+import { ReservationListEntry, toReservationListEntry } from '../dto/reservation-list.dto';
 import { Reservation, ReservationStatus } from '../entity/reservation.entity';
 import { ReservationItem } from '../entity/reservation-item.entity';
 import { CustomException } from '../../common/exception/custom.exception';
 import { ErrorCode } from '../../common/exception/error-code.enum';
 import { Store } from '../../store/entity/store.entity';
+import {
+  parsePickupInstantFromClientString,
+  isPickupInstantBeforeGraceThreshold,
+} from '../../common/utils/kst-pickup-time.util';
 
-/**
- * pickupTime multi-step 검증.
- *   1) ISO 문자열 파싱 가능 여부
- *   2) 현재 이후 시간인지
- *   3) 현재 이후 시간인지
- */
-function parsePickupTime(pickupTimeStr: string): Date {
-  const pickupTime = new Date(pickupTimeStr);
-  if (isNaN(pickupTime.getTime())) {
-    throw new CustomException(ErrorCode.INVALID_PICKUP_TIME);
-  }
-  if (pickupTime <= new Date()) {
-    throw new CustomException(ErrorCode.INVALID_PICKUP_TIME);
-  }
-  return pickupTime;
-}
+const KST_IANA = 'Asia/Seoul';
 
 function parseTimeToMinutes(time: string): number {
   const [hourText, minuteText] = time.split(':');
@@ -60,8 +46,25 @@ function parseTimeToMinutes(time: string): number {
   return hour * 60 + minute;
 }
 
-function validateStoreBusinessHours(pickupTime: Date, store: Store): void {
-  const pickupMinutes = pickupTime.getHours() * 60 + pickupTime.getMinutes();
+/** 매장 영업 시간(open/close)은 픽업 시각의 `Asia/Seoul` 벽시계 시·분으로 판단합니다. */
+function getWallMinutesInTimeZone(date: Date, timeZone: string): number {
+  const dtf = new Intl.DateTimeFormat('en-GB', {
+    timeZone,
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  });
+  let hour = 0;
+  let minute = 0;
+  for (const p of dtf.formatToParts(date)) {
+    if (p.type === 'hour') hour = Number(p.value);
+    if (p.type === 'minute') minute = Number(p.value);
+  }
+  return hour * 60 + minute;
+}
+
+function validateStoreBusinessHoursSeoul(pickupTime: Date, store: Store): void {
+  const pickupMinutes = getWallMinutesInTimeZone(pickupTime, KST_IANA);
   const openMinutes = parseTimeToMinutes(store.openTime);
   const closeMinutes = parseTimeToMinutes(store.closeTime);
 
@@ -83,49 +86,79 @@ export class ReservationService {
   ) {}
 
   /**
-   * POST /v1/reservations/hold  —  All-or-Nothing 원자적 Hold
+   * POST /v1/reservations/hold — Thin API (요청 바디 없음)
    *
-   * [선 검증 단계]
-   *   1. pickupTime multi-step 검증
-   *   2. 사용자 / 매장 존재 확인 + 영업시간 검사
-   *   3. 전체 아이템 재고를 순차 확인하여 resultItems / heldItems 빌드
+   * Redis 세션의 `last_store_id`, `selected_items`, `pickup_time`만 사용합니다.
    *
-   * [후 점유 단계]  — 전체 재고 확보 성공(allHeld)인 경우에만 실행
-   *   4. holdToken 생성 + Redis Hold 저장 (TTL 2분)
-   *   5. 세션 → WAITING_FOR_CONFIRM + hold_token 기록
+   * [선 검증]
+   *   1. 세션 존재 + 필수 필드 일괄 (없으면 400)
+   *   2. 픽업 시각: **타임존 없는 값은 KST 벽시각**으로 해석 후, [현재 − 5초] 이전이면 400 ("예약 가능한 시간이 지났습니다")
+   *   3. 사용자·매장 존재 + 영업시간(픽업 시각의 Asia/Seoul 벽시계 기준)
+   *   4. 전체 아이템 재고 All-or-Nothing 선검증
    *
-   * [실패 처리]  — 단 하나라도 OUT_OF_STOCK이면 Redis Hold를 절대 생성하지 않음
-   *   - 세션 → FAIL + last_error에 상세 실패 사유 기록
-   *
-   * 재고 차감은 confirm 단계에서만 수행 (동시성: 조건부 UPDATE).
+   * [성공] hold_token 발급 + 세션 WAITING_FOR_CONFIRM
+   * [실패] Hold 미생성 + 세션 FAIL + last_error
    */
-  async holdReservation(dto: CreateHoldDto): Promise<HoldResponseDto> {
-    const pickupTime = parsePickupTime(dto.pickupTime);
+  async holdReservation(userId: string): Promise<HoldResponseDto> {
+    const userKey = userId.trim();
+    const numericUserId = Number(userKey);
+    if (!userKey || Number.isNaN(numericUserId) || !Number.isInteger(numericUserId)) {
+      throw new BadRequestException('유효한 userId가 필요합니다.');
+    }
 
-    const user = await this.reservationRepository.findUserById(dto.userId);
+    const session = await this.redisHoldService.getSession(userKey);
+    const cs = session?.current_session;
+
+    if (!cs) {
+      throw new BadRequestException(
+        '예약 세션이 없습니다. 먼저 patchSession으로 매장·메뉴·픽업 시간을 저장해 주세요.',
+      );
+    }
+
+    const storeId = cs.last_store_id !== undefined && cs.last_store_id !== null ? Number(cs.last_store_id) : undefined;
+    const pickupRaw = cs.pickup_time;
+    const items = cs.selected_items ?? [];
+
+    if (storeId === undefined || Number.isNaN(storeId) || items.length === 0 || !pickupRaw) {
+      throw new BadRequestException(
+        'Redis 세션에 last_store_id, selected_items(1개 이상), pickup_time이 모두 필요합니다.',
+      );
+    }
+
+    const pickupTime = parsePickupInstantFromClientString(String(pickupRaw));
+    if (isPickupInstantBeforeGraceThreshold(pickupTime, 5_000)) {
+      throw new BadRequestException('예약 가능한 시간이 지났습니다');
+    }
+
+    const user = await this.reservationRepository.findUserById(numericUserId);
     if (!user) throw new CustomException(ErrorCode.USER_NOT_FOUND);
 
-    const store = await this.storeRepository.findById(dto.storeId);
+    const store = await this.storeRepository.findById(storeId);
     if (!store) throw new CustomException(ErrorCode.STORE_NOT_FOUND);
-    validateStoreBusinessHours(pickupTime, store);
+    validateStoreBusinessHoursSeoul(pickupTime, store);
 
     // ── 선 검증: 전체 아이템 재고 확인 ─────────────────────────────────────
     const heldItems: HoldData['items'] = [];
     const resultItems: HoldItemResultDto[] = [];
 
-    for (const reqItem of dto.items) {
-      const inventory = await this.inventoryRepository.findByStoreAndBread(
-        dto.storeId,
-        reqItem.breadId,
-      );
-      const breadName = inventory?.bread?.name ?? `빵 #${reqItem.breadId}`;
+    for (const line of items) {
+      const breadId = Number(line.id);
+      const qty = Number(line.count);
+      if (!Number.isInteger(breadId) || breadId < 1 || !Number.isInteger(qty) || qty < 1) {
+        throw new BadRequestException(
+          `selected_items 항목이 올바르지 않습니다: id=${line.id}, count=${line.count}`,
+        );
+      }
 
-      if (!inventory || inventory.available < reqItem.qty) {
+      const inventory = await this.inventoryRepository.findByStoreAndBread(storeId, breadId);
+      const breadName = inventory?.bread?.name ?? line.name ?? `빵 #${breadId}`;
+
+      if (!inventory || inventory.available < qty) {
         const remaining = inventory?.available ?? 0;
         resultItems.push({
-          id: String(reqItem.breadId),
+          id: String(breadId),
           name: breadName,
-          requestedCount: reqItem.qty,
+          requestedCount: qty,
           heldCount: 0,
           status: 'OUT_OF_STOCK',
           reason: `재고 부족 (남은 수량: ${remaining}개)`,
@@ -135,39 +168,37 @@ export class ReservationService {
 
       heldItems.push({
         inventoryId: Number(inventory.id),
-        breadId: reqItem.breadId,
+        breadId,
         breadName,
-        requestedQty: reqItem.qty,
-        heldQty: reqItem.qty,
+        requestedQty: qty,
+        heldQty: qty,
       });
 
       resultItems.push({
-        id: String(reqItem.breadId),
+        id: String(breadId),
         name: breadName,
-        requestedCount: reqItem.qty,
-        heldCount: reqItem.qty,
+        requestedCount: qty,
+        heldCount: qty,
         status: 'SUCCESS',
       });
     }
 
-    const allHeld = heldItems.length === dto.items.length;
-    const userKey = String(dto.userId);
+    const allHeld = heldItems.length === items.length;
 
     if (allHeld) {
-      // ── 후 점유: 모두 성공한 경우에만 Redis Hold 생성 ────────────────────
       const holdToken = randomUUID();
       const expiresAt = new Date(Date.now() + HOLD_TTL_SECONDS * 1000).toISOString();
 
       await this.redisHoldService.createHold(holdToken, {
-        userId: dto.userId,
-        storeId: dto.storeId,
+        userId: numericUserId,
+        storeId,
         pickupTime: pickupTime.toISOString(),
         items: heldItems,
         expiresAt,
       });
 
       await this.redisHoldService.patchCurrentSession(userKey, {
-        last_store_id: dto.storeId,
+        last_store_id: storeId,
         last_store_name: store.name,
         hold_token: holdToken,
         status: SessionStatus.WAITING_FOR_CONFIRM,
@@ -176,13 +207,12 @@ export class ReservationService {
 
       this.logger.log(
         `[holdReservation] ALL held → WAITING_FOR_CONFIRM` +
-          ` userId=${dto.userId} holdToken=${holdToken} items=${heldItems.length}`,
+          ` userId=${userKey} holdToken=${holdToken} items=${heldItems.length}`,
       );
 
       return { success: true, holdToken, items: resultItems };
     }
 
-    // ── 실패: Redis Hold를 생성하지 않고 실패 정보를 세션에 기록 ─────────────
     const failedSummary = resultItems
       .filter((item) => item.status !== 'SUCCESS')
       .map((item) => `${item.name}: ${item.reason}`)
@@ -194,8 +224,8 @@ export class ReservationService {
     });
 
     this.logger.warn(
-      `[holdReservation] FAIL userId=${dto.userId}` +
-        ` (held=${heldItems.length}/${dto.items.length}) ${failedSummary}`,
+      `[holdReservation] FAIL userId=${userKey}` +
+        ` (held=${heldItems.length}/${items.length}) ${failedSummary}`,
     );
 
     return { success: false, holdToken: null, items: resultItems };
@@ -204,16 +234,14 @@ export class ReservationService {
   /**
    * POST /v1/reservations/confirm
    *
-   * 1. Redis에서 holdToken 조회 (없으면 만료/미존재)
+   * 1. Redis에서 holdToken 조회 (없으면 만료/미존재 → EXPIRED 전이 후 에러)
    * 2. userId 일치 확인
-   * 3. DB 트랜잭션:
-   *    a. HELD 아이템 각각 조건부 UPDATE로 재고 차감
-   *    b. Reservation 생성
-   *    c. ReservationItem 생성
+   * 3. DB 트랜잭션: 재고 차감 → Reservation 생성 → ReservationItem 생성
    * 4. Redis Hold 삭제
-   * 5. ReservationResponseDto 반환
+   * 5. Redis 세션 전체 삭제 (AI 인사 후 재사용을 위해 완전히 제거)
+   * 6. Store 정보를 포함한 풍부한 응답 반환 (AI가 인사 메시지 구성에 활용)
    */
-  async confirmHold(dto: ConfirmHoldDto): Promise<ReservationResponseDto> {
+  async confirmHold(dto: ConfirmHoldDto): Promise<ConfirmReservationResponseDto> {
     const holdData = await this.redisHoldService.getHold(dto.holdToken);
 
     if (!holdData) {
@@ -228,6 +256,9 @@ export class ReservationService {
     }
 
     if (holdData.userId !== dto.userId) throw new CustomException(ErrorCode.HOLD_USER_MISMATCH);
+
+    const store = await this.storeRepository.findById(holdData.storeId);
+    if (!store) throw new CustomException(ErrorCode.STORE_NOT_FOUND);
 
     const pickupTime = new Date(holdData.pickupTime);
 
@@ -258,24 +289,17 @@ export class ReservationService {
       return saved;
     });
 
+    // Hold 삭제 + Redis 세션 전체 삭제
+    // 세션을 리셋이 아닌 삭제하여, 다음 대화 시작 시 완전히 새로운 세션으로 시작합니다.
     await this.redisHoldService.deleteHold(dto.holdToken);
+    await this.redisHoldService.deleteSession(String(dto.userId));
 
-    // 예약 확정 성공 → COMPLETED 로 세션 상태 전이 후 즉시 SEARCHING으로 초기화
-    const confirmedUserKey = String(dto.userId);
-    await this.redisHoldService.patchCurrentSession(confirmedUserKey, {
-      status: SessionStatus.COMPLETED,
-      hold_token: undefined,
-    });
     this.logger.log(
-      `[confirmHold] session updated → COMPLETED userId=${dto.userId} reservationId=${savedReservation.id}`,
+      `[confirmHold] confirmed userId=${dto.userId} reservationId=${savedReservation.id}` +
+        ` store="${store.name}" — session deleted`,
     );
 
-    await this.redisHoldService.resetCurrentSession(confirmedUserKey);
-    this.logger.log(
-      `User ${dto.userId}의 세션이 초기화되었습니다. 상태가 SEARCHING으로 리셋됩니다.`,
-    );
-
-    return ReservationResponseDto.from(savedReservation);
+    return ConfirmReservationResponseDto.from(savedReservation, holdData, store);
   }
 
   async getReservation(id: number): Promise<ReservationResponseDto> {
@@ -287,18 +311,38 @@ export class ReservationService {
   /**
    * GET /v1/reservations
    *
-   * userId + status 필터로 예약 목록을 조회합니다.
-   * API 친화적 소문자 status('confirmed' | 'cancelled')를 DB enum으로 변환하여 조회합니다.
+   * [지능형 필터] 서버가 자동으로 아래 조건을 적용합니다:
+   *   - status = CONFIRMED (확정된 예약만)
+   *   - pickupTime > 현재 시각 (미래 픽업만)
+   *
+   * [Side-Effect] 취소 가능한 예약이 1건 이상 존재하면
+   *   Redis 세션을 WAITING_FOR_CANCELLING_CONFIRM으로 자동 전이합니다.
+   *   AI는 이 상태를 보고 취소 흐름을 시작할 수 있습니다.
    */
-  async getReservationList(
-    userId: number,
-    status: 'confirmed' | 'cancelled',
-  ): Promise<ReservationListEntry[]> {
-    const dbStatus =
-      status === 'confirmed' ? ReservationStatus.CONFIRMED : ReservationStatus.CANCELLED;
+  async getReservationList(userId: number): Promise<ReservationListEntry[]> {
+    const confirmed = await this.reservationRepository.findByUserIdAndStatus(
+      userId,
+      ReservationStatus.CONFIRMED,
+    );
 
-    const reservations = await this.reservationRepository.findByUserIdAndStatus(userId, dbStatus);
-    return reservations.map(toReservationListEntry);
+    const now = new Date();
+    const cancellable = confirmed.filter((r) => r.pickupTime > now);
+
+    if (cancellable.length > 0) {
+      await this.redisHoldService.patchCurrentSession(String(userId), {
+        status: SessionStatus.WAITING_FOR_CANCELLING_CONFIRM,
+      });
+      this.logger.log(
+        `[getReservationList] userId=${userId} cancellable=${cancellable.length}` +
+          ` → session WAITING_FOR_CANCELLING_CONFIRM`,
+      );
+    } else {
+      this.logger.log(
+        `[getReservationList] userId=${userId} no cancellable reservations`,
+      );
+    }
+
+    return cancellable.map(toReservationListEntry);
   }
 
   /**
@@ -334,19 +378,14 @@ export class ReservationService {
       return CancelReservationResponseDto.from(reservation, feeMessage);
     });
 
-    // 취소 성공 → CANCELLED 로 세션 상태 전이 후 즉시 SEARCHING으로 초기화
-    const userKey = String(dto.userId);
-    await this.redisHoldService.patchCurrentSession(userKey, {
+    // 취소 성공 → CANCELLED 로 세션 상태 전이
+    // AI가 취소 완료 메시지를 전달한 뒤 사용자가 새 예약을 시작할 수 있도록
+    // 즉시 리셋하지 않고 CANCELLED 상태를 유지합니다.
+    await this.redisHoldService.patchCurrentSession(String(dto.userId), {
       status: SessionStatus.CANCELLED,
-      hold_token: undefined,
     });
     this.logger.log(
-      `[cancelReservation] session updated → CANCELLED userId=${dto.userId} reservationId=${id}`,
-    );
-
-    await this.redisHoldService.resetCurrentSession(userKey);
-    this.logger.log(
-      `User ${dto.userId}의 세션이 초기화되었습니다. 상태가 SEARCHING으로 리셋됩니다.`,
+      `[cancelReservation] session → CANCELLED userId=${dto.userId} reservationId=${id}`,
     );
 
     return result;
