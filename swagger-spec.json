@@ -1256,6 +1256,57 @@
           "AI"
         ]
       }
+    },
+    "/sse": {
+      "post": {
+        "description": "본문에 message와 userId 또는 guestId를 담아 호출하면 200과 함께 text/event-stream으로 status, chat, done(또는 error) 이벤트가 전달됩니다.",
+        "operationId": "SseChatController_stream",
+        "parameters": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PostSseChatDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": ""
+          }
+        },
+        "summary": "POST SSE — AI 스트림 (한 연결)",
+        "tags": [
+          "sse"
+        ]
+      }
+    },
+    "/sse/stream/{userId}": {
+      "get": {
+        "operationId": "SseController_stream",
+        "parameters": [
+          {
+            "name": "userId",
+            "required": true,
+            "in": "path",
+            "description": "사용자 식별자",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": ""
+          }
+        },
+        "summary": "userId 기반 SSE 스트림 (SseService.emitEvent로 푸시)",
+        "tags": [
+          "sse"
+        ]
+      }
     }
   },
   "info": {
@@ -1395,6 +1446,39 @@
         },
         "required": [
           "userId",
+          "message"
+        ]
+      },
+      "PostSseChatDto": {
+        "type": "object",
+        "properties": {
+          "message": {
+            "type": "string",
+            "minLength": 1,
+            "description": "사용자 질문"
+          },
+          "userId": {
+            "description": "로그인 사용자 ID",
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": -9007199254740991,
+                "maximum": 9007199254740991
+              },
+              {
+                "type": "string",
+                "minLength": 1
+              }
+            ],
+            "x-nestjs_zod-empty-type": true
+          },
+          "guestId": {
+            "description": "비로그인 게스트 식별자",
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "required": [
           "message"
         ]
       }
