@@ -1,4 +1,5 @@
 import { AsyncLocalStorage } from 'async_hooks';
+import type { MessageEvent } from '@nestjs/common';
 
 /**
  * 현재 실행 중인 chat() 호출의 컨텍스트.
@@ -7,6 +8,10 @@ import { AsyncLocalStorage } from 'async_hooks';
 export interface ChatContext {
   /** 실제 대화 주체의 userId. 도구 호출 시 이 값이 서버에 전달됩니다. */
   userId: string;
+  /**
+   * 설정 시 `emit*`은 SseService 대신 이 콜백으로만 전달 (POST /sse 단일 연결).
+   */
+  streamSink?: (ev: MessageEvent) => void;
 }
 
 /**

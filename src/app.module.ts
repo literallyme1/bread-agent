@@ -14,6 +14,7 @@ import { ReservationModule } from './reservation/reservation.module';
 import { RedisModule } from './redis/redis.module';
 import { AiModule } from './ai/ai.module';
 import { SessionModule } from './session/session.module';
+import { SseModule } from './sse/sse.module';
 
 @Module({
   imports: [
@@ -44,6 +45,7 @@ import { SessionModule } from './session/session.module';
     ReservationModule,
     SessionModule,
     AiModule,
+    SseModule,
   ],
 })
 export class AppModule {}

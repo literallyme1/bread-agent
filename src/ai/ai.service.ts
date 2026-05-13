@@ -1,4 +1,4 @@
-import { Injectable, Logger, OnApplicationShutdown, OnModuleInit } from '@nestjs/common';
+import { Injectable, Logger, MessageEvent, OnApplicationShutdown, OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import {
   InMemoryRunner,
@@ -15,6 +15,29 @@ import { join } from 'path';
 import { OpenApiToolset, OpenApiDocument } from './open-api-toolset';
 import { chatContextStorage } from './chat-context';
 import { RedisHoldService } from '../redis/redis.service';
+import { SseService } from '../sse/sse.service';
+import {
+  SseErrorCode,
+  SseStreamMessage,
+  StatusStep,
+  toMessageEvent,
+} from '../sse/sse-events.types';
+
+export type AiChatOptions = {
+  signal?: AbortSignal;
+  /** 설정 시 이벤트는 SseService가 아닌 이 sink로만 전달 (POST /sse 한 연결). */
+  streamSink?: (ev: MessageEvent) => void;
+};
+
+function isAbortError(err: unknown): boolean {
+  return err instanceof Error && err.name === 'AbortError';
+}
+
+function abortError(): Error {
+  const e = new Error('Aborted');
+  e.name = 'AbortError';
+  return e;
+}
 
 @Injectable()
 export class AiService implements OnModuleInit, OnApplicationShutdown {
@@ -25,6 +48,7 @@ export class AiService implements OnModuleInit, OnApplicationShutdown {
   constructor(
     private readonly configService: ConfigService,
     private readonly redisService: RedisHoldService,
+    private readonly sse: SseService,
   ) {}
 
   async onModuleInit(): Promise<void> {
@@ -49,7 +73,6 @@ export class AiService implements OnModuleInit, OnApplicationShutdown {
       return;
     }
 
-    // @google/genai (used internally by ADK) reads GOOGLE_API_KEY
     process.env.GOOGLE_API_KEY = apiKey;
 
     try {
@@ -64,11 +87,6 @@ export class AiService implements OnModuleInit, OnApplicationShutdown {
       );
 
       if (swaggerDoc) {
-        // AI가 호출하면 안 되거나 지침에 없는 도구를 명시적으로 제외합니다.
-        // - deleteSession : 사용자 세션을 완전 삭제 → 실수 호출 시 치명적
-        // - aiChat        : AI가 자기 자신을 재귀 호출하는 순환 위험
-        // - findStore     : 단건 매장 조회, 지침에 없음 (getStores로 대체)
-        // - findReservation: 단건 예약 조회, 지침에 없음 (listReservations로 대체)
         const excludedTools = new Set([
           'deleteSession',
           'aiChat',
@@ -89,7 +107,7 @@ export class AiService implements OnModuleInit, OnApplicationShutdown {
       const agent = new LlmAgent({
         name: 'bread_path_agent',
         description: 'Bread-Path 빵 예약 AI 에이전트',
-        model: 'gemini-2.5-flash',
+        model: 'gemini-3.1-flash-lite',
         instruction: systemInstruction,
         tools: this.toolset ? [this.toolset] : [],
       });
@@ -133,18 +151,9 @@ export class AiService implements OnModuleInit, OnApplicationShutdown {
     }
   }
 
-  /**
-   * Redis에서 사용자 세션을 조회하여 AI에게 주입할 SYSTEM CONTEXT 문자열을 생성합니다.
-   *
-   * RedisUserSession DTO의 모든 필드를 snake_case 이름 그대로 노출합니다.
-   * patchSession 도구의 파라미터명과 완전히 일치하므로 AI가 혼동 없이 필드를 참조·수정할 수 있습니다.
-   *
-   * 세션이 없으면 기본값(SEARCHING)으로 채워진 컨텍스트를 반환합니다.
-   */
   private async buildSessionContext(userId: string): Promise<string> {
     const session = await this.redisService.getSession(userId);
 
-    // KST = UTC+9. Intl.DateTimeFormat으로 한국 로컬 시각을 포맷합니다.
     const nowKst = new Intl.DateTimeFormat('ko-KR', {
       timeZone: 'Asia/Seoul',
       year: 'numeric',
@@ -154,22 +163,22 @@ export class AiService implements OnModuleInit, OnApplicationShutdown {
       minute: '2-digit',
       second: '2-digit',
       hour12: false,
-    }).format(new Date()).replace(/\. /g, '-').replace('.', '');
-    // 예: "2026-05-10 15:02:33 KST"
+    })
+      .format(new Date())
+      .replace(/\. /g, '-')
+      .replace('.', '');
     const currentTimeKst = `${nowKst} KST`;
 
-    // ── profile 필드 (ProfileSchema) ────────────────────────────────────────
     const preferred_station = session?.profile?.preferred_station ?? null;
-    const taste_tags        = session?.profile?.taste_tags        ?? [];
+    const taste_tags = session?.profile?.taste_tags ?? [];
 
-    // ── current_session 필드 (CurrentSessionSchema) ──────────────────────────
-    const status         = session?.current_session?.status          ?? 'SEARCHING';
-    const last_store_id  = session?.current_session?.last_store_id   ?? null;
+    const status = session?.current_session?.status ?? 'SEARCHING';
+    const last_store_id = session?.current_session?.last_store_id ?? null;
     const last_store_name = session?.current_session?.last_store_name ?? null;
-    const selected_items = session?.current_session?.selected_items  ?? [];
-    const pickup_time    = session?.current_session?.pickup_time      ?? null;
-    const hold_token     = session?.current_session?.hold_token       ?? null;
-    const last_error     = session?.current_session?.last_error       ?? null;
+    const selected_items = session?.current_session?.selected_items ?? [];
+    const pickup_time = session?.current_session?.pickup_time ?? null;
+    const hold_token = session?.current_session?.hold_token ?? null;
+    const last_error = session?.current_session?.last_error ?? null;
 
     const lines = [
       '■ [SYSTEM CONTEXT] ■',
@@ -200,61 +209,154 @@ export class AiService implements OnModuleInit, OnApplicationShutdown {
     return lines.join('\n');
   }
 
-  /**
-   * 사용자 메시지에 세션 컨텍스트를 주입하여 최종 메시지를 반환합니다.
-   */
   private async buildContextualMessage(userId: string, message: string): Promise<string> {
     const context = await this.buildSessionContext(userId);
     return `${context}\n\n[유저 메시지]\n${message}`;
   }
 
+  private emitSse(userId: string, payload: SseStreamMessage): void {
+    const ev = toMessageEvent(payload);
+    const ctx = chatContextStorage.getStore();
+    if (ctx?.streamSink) {
+      ctx.streamSink(ev);
+    } else {
+      this.sse.emitEvent(userId, payload);
+    }
+  }
+
+  private emitStatus(userId: string, step: StatusStep, message: string): void {
+    this.emitSse(userId, {
+      event: 'status',
+      data: { data: { step }, message },
+    });
+  }
+
+  private emitChatChunk(userId: string, chunk: string): void {
+    if (!chunk) {
+      return;
+    }
+    this.emitSse(userId, {
+      event: 'chat',
+      data: { data: { text: chunk }, message: chunk },
+    });
+  }
+
+  private emitDone(userId: string): void {
+    this.emitSse(userId, {
+      event: 'done',
+      data: { data: { ok: true }, message: '스트리밍이 종료되었습니다.' },
+    });
+  }
+
+  private emitError(userId: string, code: string, message: string): void {
+    this.emitSse(userId, {
+      event: 'error',
+      data: { data: { code }, message },
+    });
+  }
+
   /**
-   * ADK 이벤트 스트림을 처리하여 최종 응답 텍스트를 반환합니다.
-   * - 도구 호출/응답 이벤트는 피드백 루프를 위해 로깅됩니다.
-   * - isFinalResponse는 "도구 호출/응답이 이 이벤트에 없음" 수준이라, 빈 텍스트인
-   *   최종 이벤트가 먼저 오고 이후에 patchSession 등 추가 라운드가 이어질 수 있습니다.
-   *   첫 빈 최종에서 break 하면 스트림을 잘라 reply가 ""가 되므로, 스트림을 끝까지
-   *   읽고 마지막 의미 있는(공백 아닌) 최종 텍스트를 사용합니다.
+   * `runEphemeral`과 동일한 세션 생명주기이면서 `abortSignal`을 ADK에 전달한다.
+   */
+  private async *runEphemeralWithAbort(params: {
+    userId: string;
+    newMessage: Content;
+    abortSignal?: AbortSignal;
+  }): AsyncGenerator<Event, void, undefined> {
+    const r = this.runner!;
+    const session = await r.sessionService.createSession({
+      appName: r.appName,
+      userId: params.userId,
+    });
+    const sessionId = session.id;
+    try {
+      yield* r.runAsync({
+        userId: params.userId,
+        sessionId,
+        newMessage: params.newMessage,
+        abortSignal: params.abortSignal,
+      });
+    } finally {
+      await r.sessionService.deleteSession({
+        appName: r.appName,
+        userId: params.userId,
+        sessionId,
+      });
+    }
+  }
+
+  /**
+   * ADK 이벤트 스트림을 처리하여 최종 응답 텍스트를 반환하고, 중간 SSE를 발행한다.
    */
   private async processEventStream(
-    stream: AsyncIterable<unknown>,
+    stream: AsyncIterable<Event>,
     userId: string,
+    signal?: AbortSignal,
   ): Promise<string> {
     let lastFinalText = '';
     let lastNonEmptyFinalText = '';
+    let emittedProcessing = false;
+    let lastPartialModelText = '';
 
-    for await (const raw of stream) {
-      const event = raw as Event;
+    for await (const event of stream) {
+      if (signal?.aborted) {
+        throw abortError();
+      }
 
-      // 모든 이벤트 요약 — 스트림 흐름 파악용
       const calls = getFunctionCalls(event);
       const responses = getFunctionResponses(event);
       const isFinal = isFinalResponse(event);
       const text = stringifyContent(event);
+      const partial = (event as Event & { partial?: boolean }).partial === true;
+
       this.logger.debug(
         `[event] userId=${userId} author=${event.author} ` +
-        `calls=${calls.map(c => c.name).join(',')||'-'} ` +
-        `responses=${responses.map(r => r.name).join(',')||'-'} ` +
-        `isFinal=${isFinal} partial=${(event as Event & { partial?: boolean }).partial ?? false} ` +
-        `textLen=${text.length}`,
+          `calls=${calls.map((c) => c.name).join(',') || '-'} ` +
+          `responses=${responses.map((r) => r.name).join(',') || '-'} ` +
+          `isFinal=${isFinal} partial=${partial} ` +
+          `textLen=${text.length}`,
       );
 
-      // 도구 호출 파트 — AI가 어떤 도구를 호출했는지 기록 (피드백 루프 관찰)
       if (calls.length > 0) {
         for (const call of calls) {
           this.logger.log(
             `[tool:call] userId=${userId} tool=${call.name} args=${JSON.stringify(call.args)}`,
           );
         }
+        this.emitStatus(
+          userId,
+          StatusStep.THINKING,
+          `AI가 ${calls.map((c) => c.name).join(', ')} 도구를 실행 중입니다.`,
+        );
       }
 
-      // 도구 응답 파트 — 도구 실행 결과가 AI에게 피드백되었음을 기록
       if (responses.length > 0) {
         for (const resp of responses) {
           this.logger.log(
             `[tool:response] userId=${userId} tool=${resp.name} response=${JSON.stringify(resp.response)}`,
           );
         }
+        this.emitStatus(
+          userId,
+          StatusStep.THINKING,
+          '도구 실행 결과를 반영해 응답을 준비하고 있습니다.',
+        );
+      }
+
+      if (!isFinal && text && partial) {
+        if (!emittedProcessing) {
+          this.emitStatus(
+            userId,
+            StatusStep.PROCESSING,
+            'AI가 답변을 작성하고 있습니다.',
+          );
+          emittedProcessing = true;
+        }
+        const delta = text.startsWith(lastPartialModelText)
+          ? text.slice(lastPartialModelText.length)
+          : text;
+        lastPartialModelText = text;
+        this.emitChatChunk(userId, delta);
       }
 
       if (isFinal) {
@@ -262,65 +364,206 @@ export class AiService implements OnModuleInit, OnApplicationShutdown {
         if (text.trim()) {
           lastNonEmptyFinalText = text;
         }
+        if (text.trim() && !partial) {
+          const delta = text.startsWith(lastPartialModelText)
+            ? text.slice(lastPartialModelText.length)
+            : text;
+          lastPartialModelText = text;
+          if (delta) {
+            if (!emittedProcessing) {
+              this.emitStatus(
+                userId,
+                StatusStep.PROCESSING,
+                'AI가 답변을 작성하고 있습니다.',
+              );
+              emittedProcessing = true;
+            }
+            this.emitChatChunk(userId, delta);
+          }
+        }
       }
     }
 
     return lastNonEmptyFinalText || lastFinalText;
   }
 
-  /**
-   * 사용자 메시지를 AI에게 전송하고 최종 응답을 받습니다.
-   * - 전송 전 Redis 세션을 조회하여 SYSTEM CONTEXT를 메시지 앞에 주입합니다.
-   * - AsyncLocalStorage로 userId를 격리하여 도구 호출 시 userId 위변조를 차단합니다.
-   * - 각 호출은 독립적인 ephemeral 세션으로 처리됩니다.
-   */
-  async chat(userId: string, message: string): Promise<string> {
+  async chat(userId: string, message: string, options?: AiChatOptions): Promise<string> {
     if (!this.runner) {
       return 'AI agent is not initialized. Please configure GEMINI_API_KEY or GOOGLE_API_KEY.';
     }
 
-    const contextualMessage = await this.buildContextualMessage(userId, message);
+    const timeoutMs = Number(this.configService.get('AI_CHAT_TIMEOUT_MS') ?? 120_000);
+    const timeoutController = new AbortController();
+    const timeoutId = setTimeout(() => timeoutController.abort(), timeoutMs);
 
-    const userMessage: Content = {
-      role: 'user',
-      parts: [{ text: contextualMessage }],
-    };
+    const outerSignal = options?.signal;
+    const merged = outerSignal
+      ? mergeAbortSignals(outerSignal, timeoutController.signal)
+      : timeoutController.signal;
 
-    // AsyncLocalStorage에 userId를 저장하고 그 스코프 안에서 ADK runner를 실행.
-    // 도구 호출 시 OpenApiToolset이 X-Chat-User-Id 헤더에 이 userId를 자동 주입합니다.
-    return chatContextStorage.run({ userId }, async () => {
-      const stream = this.runner!.runEphemeral({ userId, newMessage: userMessage });
-      return this.processEventStream(stream, userId);
-    });
+    try {
+      return await chatContextStorage.run(
+        { userId, streamSink: options?.streamSink },
+        async () => {
+        try {
+          this.emitStatus(
+            userId,
+            StatusStep.SEARCHING,
+            '매장·예약 세션 정보를 불러오는 중입니다.',
+          );
+
+          const contextualMessage = await this.buildContextualMessage(userId, message);
+
+          this.emitStatus(
+            userId,
+            StatusStep.THINKING,
+            'AI가 예약 가능 여부를 확인하고 있습니다.',
+          );
+
+          const userMessage: Content = {
+            role: 'user',
+            parts: [{ text: contextualMessage }],
+          };
+
+          const stream = this.runEphemeralWithAbort({
+            userId,
+            newMessage: userMessage,
+            abortSignal: merged,
+          });
+          const reply = await this.processEventStream(stream, userId, merged);
+          this.emitDone(userId);
+          return reply;
+        } catch (err) {
+          if (isAbortError(err)) {
+            if (timeoutController.signal.aborted && !outerSignal?.aborted) {
+              this.logger.warn(`[chat] userId=${userId} AI_CHAT_TIMEOUT_MS exceeded`);
+              this.emitError(
+                userId,
+                SseErrorCode.AI_TIMEOUT,
+                'AI 응답 생성 시간이 초과되었습니다.',
+              );
+            } else {
+              this.logger.warn(`[chat] userId=${userId} aborted (client disconnect or cancel)`);
+              this.emitError(
+                userId,
+                SseErrorCode.CLIENT_ABORT,
+                '연결이 종료되어 작업을 중단했습니다.',
+              );
+            }
+          } else {
+            const msg = err instanceof Error ? err.message : String(err);
+            this.logger.error(
+              `[chat] userId=${userId} ${msg}`,
+              err instanceof Error ? err.stack : undefined,
+            );
+            this.emitError(userId, SseErrorCode.AI_ERROR, 'AI 응답 생성 중 오류가 발생했습니다.');
+          }
+          throw err;
+        }
+      });
+    } finally {
+      clearTimeout(timeoutId);
+    }
   }
 
-  /**
-   * 지속적인 대화 세션에서 사용자 메시지를 처리합니다.
-   * 같은 sessionId로 호출하면 이전 대화 이력이 유지됩니다.
-   */
   async runSession(
     userId: string,
     sessionId: string,
     message: string,
+    options?: AiChatOptions,
   ): Promise<string> {
     if (!this.runner) {
       return 'AI agent is not initialized. Please configure GEMINI_API_KEY or GOOGLE_API_KEY.';
     }
 
-    const contextualMessage = await this.buildContextualMessage(userId, message);
+    const timeoutMs = Number(this.configService.get('AI_CHAT_TIMEOUT_MS') ?? 120_000);
+    const timeoutController = new AbortController();
+    const timeoutId = setTimeout(() => timeoutController.abort(), timeoutMs);
+    const merged = options?.signal
+      ? mergeAbortSignals(options.signal, timeoutController.signal)
+      : timeoutController.signal;
 
-    const userMessage: Content = {
-      role: 'user',
-      parts: [{ text: contextualMessage }],
-    };
+    try {
+      return await chatContextStorage.run(
+        { userId, streamSink: options?.streamSink },
+        async () => {
+        try {
+          this.emitStatus(
+            userId,
+            StatusStep.SEARCHING,
+            '매장·예약 세션 정보를 불러오는 중입니다.',
+          );
 
-    return chatContextStorage.run({ userId }, async () => {
-      const stream = this.runner!.runAsync({ userId, sessionId, newMessage: userMessage });
-      return this.processEventStream(stream, userId);
-    });
+          const contextualMessage = await this.buildContextualMessage(userId, message);
+
+          this.emitStatus(
+            userId,
+            StatusStep.THINKING,
+            'AI가 예약 가능 여부를 확인하고 있습니다.',
+          );
+
+          const userMessage: Content = {
+            role: 'user',
+            parts: [{ text: contextualMessage }],
+          };
+
+          const stream = this.runner!.runAsync({
+            userId,
+            sessionId,
+            newMessage: userMessage,
+            abortSignal: merged,
+          });
+          const reply = await this.processEventStream(stream, userId, merged);
+          this.emitDone(userId);
+          return reply;
+        } catch (err) {
+          if (isAbortError(err)) {
+            if (timeoutController.signal.aborted && !options?.signal?.aborted) {
+              this.logger.warn(`[runSession] userId=${userId} AI_CHAT_TIMEOUT_MS exceeded`);
+              this.emitError(
+                userId,
+                SseErrorCode.AI_TIMEOUT,
+                'AI 응답 생성 시간이 초과되었습니다.',
+              );
+            } else {
+              this.logger.warn(`[runSession] userId=${userId} aborted`);
+              this.emitError(
+                userId,
+                SseErrorCode.CLIENT_ABORT,
+                '연결이 종료되어 작업을 중단했습니다.',
+              );
+            }
+          } else {
+            const msg = err instanceof Error ? err.message : String(err);
+            this.logger.error(
+              `[runSession] userId=${userId} ${msg}`,
+              err instanceof Error ? err.stack : undefined,
+            );
+            this.emitError(userId, SseErrorCode.AI_ERROR, 'AI 응답 생성 중 오류가 발생했습니다.');
+          }
+          throw err;
+        }
+      });
+    } finally {
+      clearTimeout(timeoutId);
+    }
   }
 
   get isReady(): boolean {
     return this.runner !== null;
   }
+}
+
+function mergeAbortSignals(a: AbortSignal, b: AbortSignal): AbortSignal {
+  if (a.aborted) {
+    return a;
+  }
+  if (b.aborted) {
+    return b;
+  }
+  const c = new AbortController();
+  const forward = () => c.abort();
+  a.addEventListener('abort', forward, { once: true });
+  b.addEventListener('abort', forward, { once: true });
+  return c.signal;
 }
