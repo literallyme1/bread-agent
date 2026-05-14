@@ -15,6 +15,7 @@ import { join } from 'path';
 import { OpenApiToolset, OpenApiDocument } from './open-api-toolset';
 import { chatContextStorage } from './chat-context';
 import { RedisHoldService } from '../redis/redis.service';
+import { SessionStatus } from '../redis/session.schema';
 import { SseService } from '../sse/sse.service';
 import {
   SseErrorCode,
@@ -39,8 +40,9 @@ function abortError(): Error {
   return e;
 }
 
-/** 스트림 전체 종료 후에도 자연어가 없을 때만 SSE에 보강 (중간 chunk 기준 판단 금지) */
-const EMPTY_REPLY_SSE_FALLBACK = '처리를 완료했어요. 다음 단계를 진행할까요?';
+function isHoldExpiredLastError(lastError: string): boolean {
+  return lastError.includes('임시 예약') && lastError.includes('만료');
+}
 
 @Injectable()
 export class AiService implements OnModuleInit, OnApplicationShutdown {
@@ -259,6 +261,60 @@ export class AiService implements OnModuleInit, OnApplicationShutdown {
   }
 
   /**
+   * 스트림이 끝까지 소비된 뒤 reply가 빈 경우에만 사용하는 최종 안전망 문구.
+   * Redis `current_session.status` / `last_error`와 instruction 섹션 7·10을 맞춘다.
+   */
+  private async resolveEmptyStreamFallbackMessage(userId: string): Promise<string> {
+    const session = await this.redisService.getSession(userId.trim());
+    const cs = session?.current_session;
+    const status = cs?.status;
+    const lastError = typeof cs?.last_error === 'string' ? cs.last_error : '';
+
+    if (status === SessionStatus.READY_FOR_SUMMARY && isHoldExpiredLastError(lastError)) {
+      return (
+        '재고 점유 시간(2분)이 초과되어 예약이 잠시 해제되었습니다.\n' +
+        "다시 한번 정보를 확인하고 '예약 진행'을 말씀해주세요."
+      );
+    }
+
+    switch (status) {
+      case SessionStatus.READY_FOR_SUMMARY:
+        return (
+          '예약 정보를 저장했어요.\n' +
+          '현재 예약 정보가 맞는지 확인해 주세요.\n' +
+          '이대로 진행할까요?'
+        );
+      case SessionStatus.WAITING_FOR_CONFIRM:
+        return (
+          '재고를 임시 확보했어요.\n' +
+          '2분 안에 확정해야 합니다.\n' +
+          '이대로 예약 확정할까요?'
+        );
+      case SessionStatus.WAITING_FOR_CANCELLING_CONFIRM:
+        return '취소할 예약을 확인해 주세요.\n어떤 예약을 취소할까요?';
+      case SessionStatus.COMPLETED:
+        return '예약이 확정됐어요.\n픽업 시간에 맞춰 방문해 주세요.';
+      case SessionStatus.FAIL:
+        return (
+          '처리 중 문제가 발생했어요.\n' +
+          '조건을 다시 확인하거나 다른 메뉴/매장을 찾아볼까요?'
+        );
+      case SessionStatus.EXPIRED:
+        return '오랫동안 응답이 없어 세션이 만료되었습니다.\n처음부터 다시 도와드릴까요?';
+      case SessionStatus.CANCELLED:
+        return '예약 취소가 반영됐어요.\n새로 예약을 진행할까요?';
+      case SessionStatus.SEARCHING:
+        return (
+          '검색 결과를 확인했어요.\n' +
+          '추천 가능한 매장/메뉴를 찾았습니다.\n' +
+          '어떤 메뉴로 예약할까요?'
+        );
+      default:
+        return '처리를 완료했어요.\n다음 단계를 진행할까요?';
+    }
+  }
+
+  /**
    * `runEphemeral`과 동일한 세션 생명주기이면서 `abortSignal`을 ADK에 전달한다.
    */
   private async *runEphemeralWithAbort(params: {
@@ -404,8 +460,9 @@ export class AiService implements OnModuleInit, OnApplicationShutdown {
       this.logger.warn(
         `[processEventStream] userId=${userId} empty reply after stream — SSE fallback`,
       );
-      this.emitChatChunk(userId, EMPTY_REPLY_SSE_FALLBACK);
-      reply = EMPTY_REPLY_SSE_FALLBACK;
+      const fallback = await this.resolveEmptyStreamFallbackMessage(userId);
+      this.emitChatChunk(userId, fallback);
+      reply = fallback;
     }
 
     return reply;
