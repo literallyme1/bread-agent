@@ -1,9 +1,11 @@
-import { Body, Controller, Logger, Post } from '@nestjs/common';
+import { Body, Controller, Logger, Post, Req } from '@nestjs/common';
 import { ApiOkResponse, ApiOperation, ApiTags } from '@nestjs/swagger';
 import { createZodDto } from 'nestjs-zod';
+import type { Request } from 'express';
 import { z } from 'zod';
 import { AiService } from './ai.service';
 import { ApiResponse } from '../common/dto/api-response.dto';
+import { SseService } from '../sse/sse.service';
 
 const ChatRequestSchema = z.object({
   userId: z.number().int().describe('요청 사용자 ID'),
@@ -12,12 +14,29 @@ const ChatRequestSchema = z.object({
 
 class ChatRequestDto extends createZodDto(ChatRequestSchema) {}
 
+function mergeTwoAbortSignals(a: AbortSignal, b: AbortSignal): AbortSignal {
+  if (a.aborted) {
+    return a;
+  }
+  if (b.aborted) {
+    return b;
+  }
+  const c = new AbortController();
+  const forward = () => c.abort();
+  a.addEventListener('abort', forward, { once: true });
+  b.addEventListener('abort', forward, { once: true });
+  return c.signal;
+}
+
 @ApiTags('AI')
 @Controller('v1/ai')
 export class AiController {
   private readonly logger = new Logger(AiController.name);
 
-  constructor(private readonly aiService: AiService) {}
+  constructor(
+    private readonly aiService: AiService,
+    private readonly sseService: SseService,
+  ) {}
 
   @Post('chat')
   @ApiOperation({
@@ -36,12 +55,30 @@ export class AiController {
       },
     },
   })
-  async chat(@Body() dto: ChatRequestDto): Promise<ApiResponse<{ reply: string }>> {
+  async chat(
+    @Body() dto: ChatRequestDto,
+    @Req() req: Request,
+  ): Promise<ApiResponse<{ reply: string }>> {
     this.logger.log(`[chat] userId=${dto.userId} message="${dto.message}"`);
 
-    const reply = await this.aiService.chat(String(dto.userId), dto.message);
+    const requestAbort = new AbortController();
+    const onClose = () => requestAbort.abort();
+    req.on('close', onClose);
 
-    this.logger.log(`[chat] userId=${dto.userId} reply.length=${reply.length}`);
-    return ApiResponse.success({ reply }, 'OK');
+    try {
+      const sseSig = this.sseService.getClientDisconnectSignal(String(dto.userId));
+      const clientSignal = sseSig
+        ? mergeTwoAbortSignals(requestAbort.signal, sseSig)
+        : requestAbort.signal;
+
+      const reply = await this.aiService.chat(String(dto.userId), dto.message, {
+        signal: clientSignal,
+      });
+
+      this.logger.log(`[chat] userId=${dto.userId} reply.length=${reply.length}`);
+      return ApiResponse.success({ reply }, 'OK');
+    } finally {
+      req.off('close', onClose);
+    }
   }
 }

@@ -6,7 +6,11 @@ import { ErrorCode, ErrorCodeMeta } from './error-code.enum';
  * ErrorCode enum을 기반으로 status/message를 자동 매핑
  */
 export class CustomException extends HttpException {
-  constructor(public readonly errorCode: ErrorCode) {
+  constructor(
+    public readonly errorCode: ErrorCode,
+    /** 전역 필터가 JSON `data`에 병합해 반환 (예: 세션 status / last_error) */
+    public readonly errorPayload?: Record<string, unknown>,
+  ) {
     const { status, message } = ErrorCodeMeta[errorCode];
     super(message, status);
   }
