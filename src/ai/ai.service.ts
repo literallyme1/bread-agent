@@ -39,6 +39,9 @@ function abortError(): Error {
   return e;
 }
 
+/** 스트림 전체 종료 후에도 자연어가 없을 때만 SSE에 보강 (중간 chunk 기준 판단 금지) */
+const EMPTY_REPLY_SSE_FALLBACK = '처리를 완료했어요. 다음 단계를 진행할까요?';
+
 @Injectable()
 export class AiService implements OnModuleInit, OnApplicationShutdown {
   private readonly logger = new Logger(AiService.name);
@@ -107,7 +110,7 @@ export class AiService implements OnModuleInit, OnApplicationShutdown {
       const agent = new LlmAgent({
         name: 'bread_path_agent',
         description: 'Bread-Path 빵 예약 AI 에이전트',
-        model: 'gemini-3.1-flash-lite',
+        model: 'gemini-2.5-flash',
         instruction: systemInstruction,
         tools: this.toolset ? [this.toolset] : [],
       });
@@ -297,6 +300,16 @@ export class AiService implements OnModuleInit, OnApplicationShutdown {
     let lastNonEmptyFinalText = '';
     let emittedProcessing = false;
     let lastPartialModelText = '';
+    /** SSE로 실제 전송한 chat 텍스트 누적 — 스트림 완료 후 빈 응답 판단에만 사용 */
+    let emittedChatAggregate = '';
+
+    const pushChatChunk = (delta: string) => {
+      if (!delta) {
+        return;
+      }
+      emittedChatAggregate += delta;
+      this.emitChatChunk(userId, delta);
+    };
 
     for await (const event of stream) {
       if (signal?.aborted) {
@@ -356,7 +369,7 @@ export class AiService implements OnModuleInit, OnApplicationShutdown {
           ? text.slice(lastPartialModelText.length)
           : text;
         lastPartialModelText = text;
-        this.emitChatChunk(userId, delta);
+        pushChatChunk(delta);
       }
 
       if (isFinal) {
@@ -378,13 +391,24 @@ export class AiService implements OnModuleInit, OnApplicationShutdown {
               );
               emittedProcessing = true;
             }
-            this.emitChatChunk(userId, delta);
+            pushChatChunk(delta);
           }
         }
       }
     }
 
-    return lastNonEmptyFinalText || lastFinalText;
+    const streamed = emittedChatAggregate.trim();
+    let reply = streamed.length > 0 ? emittedChatAggregate : lastNonEmptyFinalText || lastFinalText;
+
+    if (!reply.trim()) {
+      this.logger.warn(
+        `[processEventStream] userId=${userId} empty reply after stream — SSE fallback`,
+      );
+      this.emitChatChunk(userId, EMPTY_REPLY_SSE_FALLBACK);
+      reply = EMPTY_REPLY_SSE_FALLBACK;
+    }
+
+    return reply;
   }
 
   async chat(userId: string, message: string, options?: AiChatOptions): Promise<string> {
