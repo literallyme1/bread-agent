@@ -800,7 +800,7 @@
     },
     "/v1/reservations/confirm": {
       "post": {
-        "description": "holdToken 기반으로 Redis Hold를 조회하고 DB에 예약을 확정합니다. 재고 차감은 이 단계에서 조건부 UPDATE(동시성 안전)로 수행됩니다.\n\n**Side-Effects**\n- Redis Hold 삭제\n- Redis 세션 전체 삭제 (AI 인사 후 다음 예약을 위해 완전 초기화)\n\n응답에 매장 이름·위치, 아이템 이름·수량, 픽업 시각이 포함되어 AI가 예약 완료 인사 메시지를 바로 구성할 수 있습니다.",
+        "description": "holdToken 기반으로 Redis Hold를 조회하고 DB에 예약을 확정합니다. 재고 차감은 이 단계에서 조건부 UPDATE(동시성 안전)로 수행됩니다.\n\n**Hold 만료 / 세션에 hold_token 없음** — Redis 세션을 `READY_FOR_SUMMARY`로 되돌리고 `last_error`를 설정한 뒤 `400` + `HOLD_EXPIRED`(응답 `data`에 `status`, `last_error`, `errorCode`)를 반환합니다. `holdReservation`으로 재시도할 수 있습니다.\n\n**Side-Effects (성공 시)**\n- Redis Hold 삭제\n- Redis 세션 전체 삭제 (AI 인사 후 다음 예약을 위해 완전 초기화)\n\n응답에 매장 이름·위치, 아이템 이름·수량, 픽업 시각이 포함되어 AI가 예약 완료 인사 메시지를 바로 구성할 수 있습니다.",
         "operationId": "confirmReservation",
         "parameters": [],
         "requestBody": {
@@ -851,6 +851,26 @@
               }
             }
           },
+          "400": {
+            "description": "hold TTL 만료 또는 세션에 hold_token 없음 — 세션 READY_FOR_SUMMARY 강등, data에 status·last_error·errorCode",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "data": {
+                      "type": "object",
+                      "nullable": true,
+                      "example": null
+                    },
+                    "message": {
+                      "type": "string",
+                      "example": "Hold token has expired"
+                    }
+                  }
+                }
+              }
+            }
+          },
           "404": {
             "description": "holdToken 없음 또는 만료",
             "content": {
@@ -885,26 +905,6 @@
                     "message": {
                       "type": "string",
                       "example": "Out of stock"
-                    }
-                  }
-                }
-              }
-            }
-          },
-          "410": {
-            "description": "hold TTL 만료",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "properties": {
-                    "data": {
-                      "type": "object",
-                      "nullable": true,
-                      "example": null
-                    },
-                    "message": {
-                      "type": "string",
-                      "example": "Hold token has expired"
                     }
                   }
                 }

@@ -107,7 +107,7 @@ export class AiService implements OnModuleInit, OnApplicationShutdown {
       const agent = new LlmAgent({
         name: 'bread_path_agent',
         description: 'Bread-Path 빵 예약 AI 에이전트',
-        model: 'gemini-3.1-flash-lite',
+        model: 'gemini-2.5-flash',
         instruction: systemInstruction,
         tools: this.toolset ? [this.toolset] : [],
       });

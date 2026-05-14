@@ -63,7 +63,7 @@ export const ErrorCodeMeta: Record<ErrorCode, { status: HttpStatus; message: str
     message: 'Hold not found or already expired',
   },
   [ErrorCode.HOLD_EXPIRED]: {
-    status: HttpStatus.GONE,
+    status: HttpStatus.BAD_REQUEST,
     message: 'Hold token has expired',
   },
   [ErrorCode.HOLD_USER_MISMATCH]: {

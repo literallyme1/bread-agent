@@ -12,7 +12,8 @@ import { ApiResponse } from '../dto/api-response.dto';
 
 /**
  * 전역 예외 핸들러
- * CustomException / HttpException / 알 수 없는 예외를 모두 { data: null, message } 형태로 응답
+ * CustomException은 `errorPayload`가 있으면 `data`에 `errorCode`와 함께 반환합니다.
+ * 그 외 HttpException / 알 수 없는 예외는 { data: null, message } 형태로 응답합니다.
  */
 @Catch()
 export class GlobalExceptionFilter implements ExceptionFilter {
@@ -28,6 +29,12 @@ export class GlobalExceptionFilter implements ExceptionFilter {
     if (exception instanceof CustomException) {
       status = exception.getStatus();
       message = exception.getMessage();
+      const data =
+        exception.errorPayload != null
+          ? { errorCode: exception.errorCode, ...exception.errorPayload }
+          : null;
+      response.status(status).json({ data, message });
+      return;
     } else if (exception instanceof HttpException) {
       status = exception.getStatus();
       const res = exception.getResponse();
@@ -44,5 +51,6 @@ export class GlobalExceptionFilter implements ExceptionFilter {
     }
 
     response.status(status).json(ApiResponse.error(message));
+    return;
   }
 }
