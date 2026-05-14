@@ -27,6 +27,10 @@ import {
 
 const KST_IANA = 'Asia/Seoul';
 
+/** confirm 시 세션 hold 만료/불일치 시 Redis last_error 및 API data에 동일하게 사용 */
+const HOLD_EXPIRED_SESSION_MESSAGE =
+  '임시 예약 시간이 만료되었습니다. 다시 한번 예약 정보를 확인하고 재시도해주세요.';
+
 function parseTimeToMinutes(time: string): number {
   const [hourText, minuteText] = time.split(':');
   const hour = Number(hourText);
@@ -232,27 +236,71 @@ export class ReservationService {
   }
 
   /**
+   * 세션 hold 만료/누락 시 READY_FOR_SUMMARY로 강등한 뒤 HOLD_EXPIRED를 던집니다.
+   * Redis patch 완료 후 예외를 발생시켜 응답 `data`와 저장 세션이 일치합니다.
+   */
+  private async applyHoldExpiredDemotionAndThrow(
+    userKey: string,
+    holdTokenForLog: string,
+  ): Promise<never> {
+    await this.redisHoldService.patchCurrentSession(userKey, {
+      status: SessionStatus.READY_FOR_SUMMARY,
+      last_error: HOLD_EXPIRED_SESSION_MESSAGE,
+      hold_token: undefined,
+    });
+    this.logger.warn(
+      `[confirmHold] hold missing/expired → READY_FOR_SUMMARY userId=${userKey} holdToken=${holdTokenForLog}`,
+    );
+    throw new CustomException(ErrorCode.HOLD_EXPIRED, {
+      status: SessionStatus.READY_FOR_SUMMARY,
+      last_error: HOLD_EXPIRED_SESSION_MESSAGE,
+    });
+  }
+
+  /**
    * POST /v1/reservations/confirm
    *
-   * 1. Redis에서 holdToken 조회 (없으면 만료/미존재 → EXPIRED 전이 후 에러)
-   * 2. userId 일치 확인
-   * 3. DB 트랜잭션: 재고 차감 → Reservation 생성 → ReservationItem 생성
-   * 4. Redis Hold 삭제
-   * 5. Redis 세션 전체 삭제 (AI 인사 후 재사용을 위해 완전히 제거)
-   * 6. Store 정보를 포함한 풍부한 응답 반환 (AI가 인사 메시지 구성에 활용)
+   * 1. Redis 세션에서 hold_token 존재 여부를 최우선 검사 (없으면 WAITING_FOR_CONFIRM → READY_FOR_SUMMARY 강등 + HOLD_EXPIRED)
+   * 2. 요청 holdToken과 세션 hold_token 일치 확인
+   * 3. Redis Hold 조회 (없으면 강등 + HOLD_EXPIRED — 세션과 Hold TTL 불일치 대비)
+   * 4. userId 일치 확인
+   * 5. DB 트랜잭션: 재고 차감 → Reservation 생성 → ReservationItem 생성
+   * 6. Redis Hold 삭제
+   * 7. Redis 세션 전체 삭제 (AI 인사 후 재사용을 위해 완전히 제거)
+   * 8. Store 정보를 포함한 풍부한 응답 반환 (AI가 인사 메시지 구성에 활용)
    */
   async confirmHold(dto: ConfirmHoldDto): Promise<ConfirmReservationResponseDto> {
-    const holdData = await this.redisHoldService.getHold(dto.holdToken);
+    const userKey = String(dto.userId);
+    const holdTokenFromClient = dto.holdToken?.trim();
+    if (!holdTokenFromClient) {
+      throw new BadRequestException('holdToken이 필요합니다.');
+    }
+
+    const session = await this.redisHoldService.getSession(userKey);
+    const cs = session?.current_session;
+
+    if (!cs) {
+      throw new BadRequestException(
+        '예약 세션이 없습니다. 먼저 patchSession으로 매장·메뉴·픽업 시간을 저장해 주세요.',
+      );
+    }
+
+    const tokenFromSession =
+      typeof cs.hold_token === 'string' ? cs.hold_token.trim() : '';
+    if (!tokenFromSession) {
+      await this.applyHoldExpiredDemotionAndThrow(userKey, holdTokenFromClient);
+      throw new Error('unreachable');
+    }
+
+    if (tokenFromSession !== holdTokenFromClient) {
+      throw new BadRequestException('세션의 hold_token과 요청 holdToken이 일치하지 않습니다.');
+    }
+
+    const holdData = await this.redisHoldService.getHold(holdTokenFromClient);
 
     if (!holdData) {
-      // Hold TTL 만료 또는 존재하지 않는 토큰 → 세션을 EXPIRED로 전이 후 에러 반환
-      await this.redisHoldService.patchCurrentSession(String(dto.userId), {
-        status: SessionStatus.EXPIRED,
-      });
-      this.logger.warn(
-        `[confirmHold] hold not found → session EXPIRED userId=${dto.userId} holdToken=${dto.holdToken}`,
-      );
-      throw new CustomException(ErrorCode.HOLD_EXPIRED);
+      await this.applyHoldExpiredDemotionAndThrow(userKey, holdTokenFromClient);
+      throw new Error('unreachable');
     }
 
     if (holdData.userId !== dto.userId) throw new CustomException(ErrorCode.HOLD_USER_MISMATCH);
@@ -291,7 +339,7 @@ export class ReservationService {
 
     // Hold 삭제 + Redis 세션 전체 삭제
     // 세션을 리셋이 아닌 삭제하여, 다음 대화 시작 시 완전히 새로운 세션으로 시작합니다.
-    await this.redisHoldService.deleteHold(dto.holdToken);
+    await this.redisHoldService.deleteHold(holdTokenFromClient);
     await this.redisHoldService.deleteSession(String(dto.userId));
 
     this.logger.log(

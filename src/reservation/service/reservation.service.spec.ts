@@ -262,6 +262,12 @@ describe('ReservationService', () => {
     };
 
     beforeEach(() => {
+      redisHoldService.getSession.mockResolvedValue(
+        baseSession({
+          status: 'WAITING_FOR_CONFIRM',
+          hold_token: holdToken,
+        }) as any,
+      );
       redisHoldService.patchCurrentSession.mockResolvedValue(undefined);
       redisHoldService.deleteSession.mockResolvedValue(undefined);
     });
@@ -297,10 +303,36 @@ describe('ReservationService', () => {
       expect(redisHoldService.deleteSession).toHaveBeenCalledWith('1');
     });
 
-    it('이미 만료된 holdToken → HOLD_EXPIRED', async () => {
+    it('이미 만료된 holdToken → HOLD_EXPIRED + 세션 강등', async () => {
       redisHoldService.getHold.mockResolvedValue(null);
-      await expect(service.confirmHold(confirmDto)).rejects.toThrow(
-        new CustomException(ErrorCode.HOLD_EXPIRED),
+      await expect(service.confirmHold(confirmDto)).rejects.toMatchObject({
+        errorCode: ErrorCode.HOLD_EXPIRED,
+        errorPayload: {
+          status: 'READY_FOR_SUMMARY',
+          last_error: '임시 예약 시간이 만료되었습니다. 다시 한번 예약 정보를 확인하고 재시도해주세요.',
+        },
+      });
+      expect(redisHoldService.patchCurrentSession).toHaveBeenCalledWith('1', {
+        status: 'READY_FOR_SUMMARY',
+        last_error: '임시 예약 시간이 만료되었습니다. 다시 한번 예약 정보를 확인하고 재시도해주세요.',
+        hold_token: undefined,
+      });
+    });
+
+    it('세션에 hold_token 없음 → HOLD_EXPIRED + 세션 강등', async () => {
+      redisHoldService.getSession.mockResolvedValue(
+        baseSession({ status: 'WAITING_FOR_CONFIRM', hold_token: undefined }) as any,
+      );
+      redisHoldService.getHold.mockResolvedValue(null);
+      await expect(service.confirmHold(confirmDto)).rejects.toMatchObject({
+        errorCode: ErrorCode.HOLD_EXPIRED,
+      });
+      expect(redisHoldService.patchCurrentSession).toHaveBeenCalledWith(
+        '1',
+        expect.objectContaining({
+          status: 'READY_FOR_SUMMARY',
+          hold_token: undefined,
+        }),
       );
     });
 
