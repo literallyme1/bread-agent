@@ -25,6 +25,42 @@
 
 [Nest](https://github.com/nestjs/nest) framework TypeScript starter repository.
 
+## Bread Agent — 로컬에서 프론트·백엔드 실행
+
+백엔드(NestJS)는 기본 **8080** 포트에서 뜨고, 프론트(Next.js)는 **3000**에서 뜹니다. 프론트는 `NEXT_PUBLIC_API_BASE_URL`로 백엔드에 `POST /sse` 스트림을 붙입니다.
+
+### 백엔드 (저장소 루트)
+
+```bash
+npm install
+npm run start:dev
+```
+
+- API·Swagger: `http://localhost:8080` (Swagger UI: `/swagger`)
+- 포트는 환경 변수 `PORT`로 바꿀 수 있습니다. 미설정 시 **8080**입니다.
+
+### 프론트엔드 (`frontend/`)
+
+```bash
+cd frontend
+npm install
+```
+
+`frontend/env.example`을 참고해 `frontend/.env.local`을 만듭니다.
+
+```bash
+# frontend/.env.local
+NEXT_PUBLIC_API_BASE_URL=http://localhost:8080
+```
+
+```bash
+npm run dev
+```
+
+- 앱: `http://localhost:3000`
+
+백엔드 `main.ts`에서 `http://localhost:3000` 출처만 CORS 허용합니다. 다른 오리진을 쓰면 백엔드 CORS 설정을 같이 맞춰 주세요.
+
 ## Project setup
 
 ```bash
