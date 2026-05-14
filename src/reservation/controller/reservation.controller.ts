@@ -3,7 +3,6 @@ import {
   ApiBadRequestResponse,
   ApiConflictResponse,
   ApiCreatedResponse,
-  ApiGoneResponse,
   ApiHeader,
   ApiNotFoundResponse,
   ApiOkResponse,
@@ -145,7 +144,8 @@ export class ReservationController {
     description:
       'holdToken 기반으로 Redis Hold를 조회하고 DB에 예약을 확정합니다. ' +
       '재고 차감은 이 단계에서 조건부 UPDATE(동시성 안전)로 수행됩니다.\n\n' +
-      '**Side-Effects**\n' +
+      '**Hold 만료 / 세션에 hold_token 없음** — Redis 세션을 `READY_FOR_SUMMARY`로 되돌리고 `last_error`를 설정한 뒤 `400` + `HOLD_EXPIRED`(응답 `data`에 `status`, `last_error`, `errorCode`)를 반환합니다. `holdReservation`으로 재시도할 수 있습니다.\n\n' +
+      '**Side-Effects (성공 시)**\n' +
       '- Redis Hold 삭제\n' +
       '- Redis 세션 전체 삭제 (AI 인사 후 다음 예약을 위해 완전 초기화)\n\n' +
       '응답에 매장 이름·위치, 아이템 이름·수량, 픽업 시각이 포함되어 ' +
@@ -184,8 +184,8 @@ export class ReservationController {
     description: '재고 부족 (confirm 시점 재확인)',
     schema: errorSchema('Out of stock'),
   })
-  @ApiGoneResponse({
-    description: 'hold TTL 만료',
+  @ApiBadRequestResponse({
+    description: 'hold TTL 만료 또는 세션에 hold_token 없음 — 세션 READY_FOR_SUMMARY 강등, data에 status·last_error·errorCode',
     schema: errorSchema('Hold token has expired'),
   })
   async confirmHold(@Body() dto: ConfirmHoldDto): Promise<ApiResponse<ConfirmReservationResponseDto>> {
