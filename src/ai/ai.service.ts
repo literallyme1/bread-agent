@@ -23,9 +23,6 @@ import {
   toMessageEvent,
 } from '../sse/sse-events.types';
 
-/** tool-only 스트림 종료 시 SSE·HTTP 응답용 보조 문구 (모델 무응답 간헐 이슈 완화) */
-const SSE_EMPTY_REPLY_FALLBACK = '처리를 완료했어요. 다음 단계를 진행할까요?';
-
 export type AiChatOptions = {
   signal?: AbortSignal;
   /** 설정 시 이벤트는 SseService가 아닌 이 sink로만 전달 (POST /sse 한 연결). */
@@ -110,7 +107,7 @@ export class AiService implements OnModuleInit, OnApplicationShutdown {
       const agent = new LlmAgent({
         name: 'bread_path_agent',
         description: 'Bread-Path 빵 예약 AI 에이전트',
-        model: 'gemini-2.5-flash',
+        model: 'gemini-3.1-flash-lite',
         instruction: systemInstruction,
         tools: this.toolset ? [this.toolset] : [],
       });
@@ -290,28 +287,16 @@ export class AiService implements OnModuleInit, OnApplicationShutdown {
 
   /**
    * ADK 이벤트 스트림을 처리하여 최종 응답 텍스트를 반환하고, 중간 SSE를 발행한다.
-   * `hasAssistantMessage`: 공백이 아닌 assistant 텍스트가 `chat` 이벤트로 한 번이라도 나갔는지.
    */
   private async processEventStream(
     stream: AsyncIterable<Event>,
     userId: string,
     signal?: AbortSignal,
-  ): Promise<{ reply: string; hasAssistantMessage: boolean }> {
+  ): Promise<string> {
     let lastFinalText = '';
     let lastNonEmptyFinalText = '';
     let emittedProcessing = false;
     let lastPartialModelText = '';
-    let hasAssistantMessage = false;
-
-    const emitAssistantDelta = (delta: string): void => {
-      if (!delta) {
-        return;
-      }
-      this.emitChatChunk(userId, delta);
-      if (delta.trim().length > 0) {
-        hasAssistantMessage = true;
-      }
-    };
 
     for await (const event of stream) {
       if (signal?.aborted) {
@@ -371,7 +356,7 @@ export class AiService implements OnModuleInit, OnApplicationShutdown {
           ? text.slice(lastPartialModelText.length)
           : text;
         lastPartialModelText = text;
-        emitAssistantDelta(delta);
+        this.emitChatChunk(userId, delta);
       }
 
       if (isFinal) {
@@ -393,18 +378,13 @@ export class AiService implements OnModuleInit, OnApplicationShutdown {
               );
               emittedProcessing = true;
             }
-            emitAssistantDelta(delta);
+            this.emitChatChunk(userId, delta);
           }
         }
       }
     }
 
-    const reply = lastNonEmptyFinalText || lastFinalText;
-    if (!hasAssistantMessage && reply.trim().length > 0) {
-      emitAssistantDelta(reply.trim());
-    }
-
-    return { reply, hasAssistantMessage };
+    return lastNonEmptyFinalText || lastFinalText;
   }
 
   async chat(userId: string, message: string, options?: AiChatOptions): Promise<string> {
@@ -450,13 +430,9 @@ export class AiService implements OnModuleInit, OnApplicationShutdown {
             newMessage: userMessage,
             abortSignal: merged,
           });
-          const { reply, hasAssistantMessage } = await this.processEventStream(stream, userId, merged);
-          if (!hasAssistantMessage) {
-            this.logger.warn(`[chat] userId=${userId} stream ended without assistant text; fallback chat`);
-            this.emitChatChunk(userId, SSE_EMPTY_REPLY_FALLBACK);
-          }
+          const reply = await this.processEventStream(stream, userId, merged);
           this.emitDone(userId);
-          return hasAssistantMessage ? reply : reply.trim() || SSE_EMPTY_REPLY_FALLBACK;
+          return reply;
         } catch (err) {
           if (isAbortError(err)) {
             if (timeoutController.signal.aborted && !outerSignal?.aborted) {
@@ -537,13 +513,9 @@ export class AiService implements OnModuleInit, OnApplicationShutdown {
             newMessage: userMessage,
             abortSignal: merged,
           });
-          const { reply, hasAssistantMessage } = await this.processEventStream(stream, userId, merged);
-          if (!hasAssistantMessage) {
-            this.logger.warn(`[runSession] userId=${userId} stream ended without assistant text; fallback chat`);
-            this.emitChatChunk(userId, SSE_EMPTY_REPLY_FALLBACK);
-          }
+          const reply = await this.processEventStream(stream, userId, merged);
           this.emitDone(userId);
-          return hasAssistantMessage ? reply : reply.trim() || SSE_EMPTY_REPLY_FALLBACK;
+          return reply;
         } catch (err) {
           if (isAbortError(err)) {
             if (timeoutController.signal.aborted && !options?.signal?.aborted) {
