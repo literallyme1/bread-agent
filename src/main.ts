@@ -14,6 +14,11 @@ async function bootstrap() {
   app.useGlobalPipes(new ZodValidationPipe());
   app.useGlobalFilters(new GlobalExceptionFilter());
 
+  app.enableCors({
+    origin: ['http://localhost:3000'],
+    credentials: true,
+  });
+
   const swaggerConfig = new DocumentBuilder()
     .setTitle('Bread API')
     .setDescription('Bread Reservation & Inventory API')
@@ -31,7 +36,7 @@ async function bootstrap() {
     console.warn('Failed to write swagger-spec.json:', err);
   }
 
-  const port = process.env.PORT ?? 3000;
+  const port = process.env.PORT ?? 8080;
   await app.listen(port);
   console.log(`Server running on port ${port}`);
   console.log(`Swagger UI: http://localhost:${port}/swagger`);

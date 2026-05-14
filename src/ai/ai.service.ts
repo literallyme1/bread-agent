@@ -88,7 +88,7 @@ export class AiService implements OnModuleInit, OnApplicationShutdown {
 
       const baseUrl = this.configService.get<string>(
         'API_BASE_URL',
-        'http://localhost:3000',
+        'http://localhost:8080',
       );
 
       if (swaggerDoc) {
@@ -112,7 +112,7 @@ export class AiService implements OnModuleInit, OnApplicationShutdown {
       const agent = new LlmAgent({
         name: 'bread_path_agent',
         description: 'Bread-Path 빵 예약 AI 에이전트',
-        model: 'gemini-2.5-flash',
+        model: 'gemini-3.1-flash-lite',
         instruction: systemInstruction,
         tools: this.toolset ? [this.toolset] : [],
       });
