@@ -198,6 +198,6 @@ npm run dev
 npm test
 npm run test:e2e
 
-Backend: http://localhost:8080
-Frontend: http://localhost:3000
+Backend: http://localhost:8080 <br>
+Frontend: http://localhost:3000 <br>
 Swagger: http://localhost:8080/swagger
