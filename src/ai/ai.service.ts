@@ -1,4 +1,10 @@
-import { Injectable, Logger, MessageEvent, OnApplicationShutdown, OnModuleInit } from '@nestjs/common';
+import {
+  Injectable,
+  Logger,
+  MessageEvent,
+  OnApplicationShutdown,
+  OnModuleInit,
+} from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import {
   InMemoryRunner,
@@ -26,20 +32,22 @@ import {
 
 export type AiChatOptions = {
   signal?: AbortSignal;
-  /** 설정 시 이벤트는 SseService가 아닌 이 sink로만 전달 (POST /sse 한 연결). */
   streamSink?: (ev: MessageEvent) => void;
 };
 
+/** 오류가 요청 중단으로 발생했는지 판별한다. */
 function isAbortError(err: unknown): boolean {
   return err instanceof Error && err.name === 'AbortError';
 }
 
+/** 일관된 요청 중단 오류를 생성한다. */
 function abortError(): Error {
   const e = new Error('Aborted');
   e.name = 'AbortError';
   return e;
 }
 
+/** 마지막 서버 오류가 Hold 만료를 의미하는지 판별한다. */
 function isHoldExpiredLastError(lastError: string): boolean {
   return lastError.includes('임시 예약') && lastError.includes('만료');
 }
@@ -56,16 +64,19 @@ export class AiService implements OnModuleInit, OnApplicationShutdown {
     private readonly sse: SseService,
   ) {}
 
+  /** 애플리케이션 시작 시 AI Agent와 API Toolset을 초기화한다. */
   async onModuleInit(): Promise<void> {
     await this.initialize();
   }
 
+  /** 애플리케이션 종료 시 AI Toolset 리소스를 정리한다. */
   async onApplicationShutdown(): Promise<void> {
     if (this.toolset) {
       await this.toolset.close();
     }
   }
 
+  /** 시스템 지침과 Swagger 명세로 Gemini Agent를 구성한다. */
   private async initialize(): Promise<void> {
     const apiKey =
       this.configService.get<string>('GEMINI_API_KEY') ??
@@ -131,9 +142,15 @@ export class AiService implements OnModuleInit, OnApplicationShutdown {
     }
   }
 
+  /** AI의 서버 책임 분리 지침을 파일에서 불러온다. */
   private async loadSystemInstruction(): Promise<string> {
     try {
-      const filePath = join(__dirname, '..', 'prompts', 'bread-system-instruction.md');
+      const filePath = join(
+        __dirname,
+        '..',
+        'prompts',
+        'bread-system-instruction.md',
+      );
       const content = await fsPromises.readFile(filePath, 'utf-8');
       this.logger.log('System instruction loaded successfully');
       return content;
@@ -146,6 +163,7 @@ export class AiService implements OnModuleInit, OnApplicationShutdown {
     }
   }
 
+  /** REST API를 Function Tool로 변환할 Swagger 명세를 불러온다. */
   private async loadSwaggerDocument(): Promise<OpenApiDocument | null> {
     try {
       const filePath = join(process.cwd(), 'swagger-spec.json');
@@ -156,7 +174,10 @@ export class AiService implements OnModuleInit, OnApplicationShutdown {
     }
   }
 
-  private async buildSessionContext(userId: string): Promise<string> {
+  /** Redis의 서버 소유 상태를 AI가 판단 근거로 사용할 컨텍스트로 구성한다. */
+  private async buildServerOwnedSessionContext(
+    userId: string,
+  ): Promise<string> {
     const session = await this.redisService.getSession(userId);
 
     const nowKst = new Intl.DateTimeFormat('ko-KR', {
@@ -214,12 +235,17 @@ export class AiService implements OnModuleInit, OnApplicationShutdown {
     return lines.join('\n');
   }
 
-  private async buildContextualMessage(userId: string, message: string): Promise<string> {
-    const context = await this.buildSessionContext(userId);
+  /** 사용자 메시지에 서버가 검증한 최신 예약 상태를 결합한다. */
+  private async buildGroundedUserMessage(
+    userId: string,
+    message: string,
+  ): Promise<string> {
+    const context = await this.buildServerOwnedSessionContext(userId);
     return `${context}\n\n[유저 메시지]\n${message}`;
   }
 
-  private emitSse(userId: string, payload: SseStreamMessage): void {
+  /** 현재 채팅 연결에 SSE 이벤트를 전달한다. */
+  private emitStreamEvent(userId: string, payload: SseStreamMessage): void {
     const ev = toMessageEvent(payload);
     const ctx = chatContextStorage.getStore();
     if (ctx?.streamSink) {
@@ -229,48 +255,57 @@ export class AiService implements OnModuleInit, OnApplicationShutdown {
     }
   }
 
+  /** AI 처리 단계 상태를 SSE로 전달한다. */
   private emitStatus(userId: string, step: StatusStep, message: string): void {
-    this.emitSse(userId, {
+    this.emitStreamEvent(userId, {
       event: 'status',
       data: { data: { step }, message },
     });
   }
 
+  /** AI 답변 텍스트 조각을 SSE로 전달한다. */
   private emitChatChunk(userId: string, chunk: string): void {
     if (!chunk) {
       return;
     }
-    this.emitSse(userId, {
+    this.emitStreamEvent(userId, {
       event: 'chat',
       data: { data: { text: chunk }, message: chunk },
     });
   }
 
+  /** 정상적인 AI 스트림 종료를 SSE로 전달한다. */
   private emitDone(userId: string): void {
-    this.emitSse(userId, {
+    this.emitStreamEvent(userId, {
       event: 'done',
       data: { data: { ok: true }, message: '스트리밍이 종료되었습니다.' },
     });
   }
 
+  /** AI 처리 오류를 SSE로 전달한다. */
   private emitError(userId: string, code: string, message: string): void {
-    this.emitSse(userId, {
+    this.emitStreamEvent(userId, {
       event: 'error',
       data: { data: { code }, message },
     });
   }
 
-  /**
-   * 스트림이 끝까지 소비된 뒤 reply가 빈 경우에만 사용하는 최종 안전망 문구.
-   * Redis `current_session.status` / `last_error`와 instruction 섹션 7·10을 맞춘다.
-   */
-  private async resolveEmptyStreamFallbackMessage(userId: string): Promise<string> {
+  /** 빈 모델 응답을 Redis 상태에 맞는 안전한 기본 응답으로 복구한다. */
+  private async buildStateAwareFallbackResponse(
+    userId: string,
+  ): Promise<string> {
     const session = await this.redisService.getSession(userId.trim());
-    const cs = session?.current_session;
-    const status = cs?.status;
-    const lastError = typeof cs?.last_error === 'string' ? cs.last_error : '';
+    const reservationContext = session?.current_session;
+    const status = reservationContext?.status;
+    const lastError =
+      typeof reservationContext?.last_error === 'string'
+        ? reservationContext.last_error
+        : '';
 
-    if (status === SessionStatus.READY_FOR_SUMMARY && isHoldExpiredLastError(lastError)) {
+    if (
+      status === SessionStatus.READY_FOR_SUMMARY &&
+      isHoldExpiredLastError(lastError)
+    ) {
       return (
         '재고 점유 시간(2분)이 초과되어 예약이 잠시 해제되었습니다.\n' +
         "다시 한번 정보를 확인하고 '예약 진행'을 말씀해주세요."
@@ -314,10 +349,8 @@ export class AiService implements OnModuleInit, OnApplicationShutdown {
     }
   }
 
-  /**
-   * `runEphemeral`과 동일한 세션 생명주기이면서 `abortSignal`을 ADK에 전달한다.
-   */
-  private async *runEphemeralWithAbort(params: {
+  /** 요청마다 격리된 ADK 세션을 생성하고 종료 시 제거한다. */
+  private async *runIsolatedAgentSession(params: {
     userId: string;
     newMessage: Content;
     abortSignal?: AbortSignal;
@@ -344,10 +377,8 @@ export class AiService implements OnModuleInit, OnApplicationShutdown {
     }
   }
 
-  /**
-   * ADK 이벤트 스트림을 처리하여 최종 응답 텍스트를 반환하고, 중간 SSE를 발행한다.
-   */
-  private async processEventStream(
+  /** ADK 이벤트를 SSE로 변환하고 빈 응답 Fallback까지 보장한다. */
+  private async streamAgentEventsWithFallback(
     stream: AsyncIterable<Event>,
     userId: string,
     signal?: AbortSignal,
@@ -356,7 +387,6 @@ export class AiService implements OnModuleInit, OnApplicationShutdown {
     let lastNonEmptyFinalText = '';
     let emittedProcessing = false;
     let lastPartialModelText = '';
-    /** SSE로 실제 전송한 chat 텍스트 누적 — 스트림 완료 후 빈 응답 판단에만 사용 */
     let emittedChatAggregate = '';
 
     const pushChatChunk = (delta: string) => {
@@ -454,13 +484,16 @@ export class AiService implements OnModuleInit, OnApplicationShutdown {
     }
 
     const streamed = emittedChatAggregate.trim();
-    let reply = streamed.length > 0 ? emittedChatAggregate : lastNonEmptyFinalText || lastFinalText;
+    let reply =
+      streamed.length > 0
+        ? emittedChatAggregate
+        : lastNonEmptyFinalText || lastFinalText;
 
     if (!reply.trim()) {
       this.logger.warn(
-        `[processEventStream] userId=${userId} empty reply after stream — SSE fallback`,
+        `[streamAgentEventsWithFallback] userId=${userId} empty reply after stream`,
       );
-      const fallback = await this.resolveEmptyStreamFallbackMessage(userId);
+      const fallback = await this.buildStateAwareFallbackResponse(userId);
       this.emitChatChunk(userId, fallback);
       reply = fallback;
     }
@@ -468,12 +501,19 @@ export class AiService implements OnModuleInit, OnApplicationShutdown {
     return reply;
   }
 
-  async chat(userId: string, message: string, options?: AiChatOptions): Promise<string> {
+  /** 단일 요청용 AI 세션을 실행하고 SSE 응답을 스트리밍한다. */
+  async chat(
+    userId: string,
+    message: string,
+    options?: AiChatOptions,
+  ): Promise<string> {
     if (!this.runner) {
       return 'AI agent is not initialized. Please configure GEMINI_API_KEY or GOOGLE_API_KEY.';
     }
 
-    const timeoutMs = Number(this.configService.get('AI_CHAT_TIMEOUT_MS') ?? 120_000);
+    const timeoutMs = Number(
+      this.configService.get('AI_CHAT_TIMEOUT_MS') ?? 120_000,
+    );
     const timeoutController = new AbortController();
     const timeoutId = setTimeout(() => timeoutController.abort(), timeoutMs);
 
@@ -486,67 +526,84 @@ export class AiService implements OnModuleInit, OnApplicationShutdown {
       return await chatContextStorage.run(
         { userId, streamSink: options?.streamSink },
         async () => {
-        try {
-          this.emitStatus(
-            userId,
-            StatusStep.SEARCHING,
-            '매장·예약 세션 정보를 불러오는 중입니다.',
-          );
+          try {
+            this.emitStatus(
+              userId,
+              StatusStep.SEARCHING,
+              '매장·예약 세션 정보를 불러오는 중입니다.',
+            );
 
-          const contextualMessage = await this.buildContextualMessage(userId, message);
+            const contextualMessage = await this.buildGroundedUserMessage(
+              userId,
+              message,
+            );
 
-          this.emitStatus(
-            userId,
-            StatusStep.THINKING,
-            'AI가 예약 가능 여부를 확인하고 있습니다.',
-          );
+            this.emitStatus(
+              userId,
+              StatusStep.THINKING,
+              'AI가 예약 가능 여부를 확인하고 있습니다.',
+            );
 
-          const userMessage: Content = {
-            role: 'user',
-            parts: [{ text: contextualMessage }],
-          };
+            const userMessage: Content = {
+              role: 'user',
+              parts: [{ text: contextualMessage }],
+            };
 
-          const stream = this.runEphemeralWithAbort({
-            userId,
-            newMessage: userMessage,
-            abortSignal: merged,
-          });
-          const reply = await this.processEventStream(stream, userId, merged);
-          this.emitDone(userId);
-          return reply;
-        } catch (err) {
-          if (isAbortError(err)) {
-            if (timeoutController.signal.aborted && !outerSignal?.aborted) {
-              this.logger.warn(`[chat] userId=${userId} AI_CHAT_TIMEOUT_MS exceeded`);
-              this.emitError(
-                userId,
-                SseErrorCode.AI_TIMEOUT,
-                'AI 응답 생성 시간이 초과되었습니다.',
-              );
+            const stream = this.runIsolatedAgentSession({
+              userId,
+              newMessage: userMessage,
+              abortSignal: merged,
+            });
+            const reply = await this.streamAgentEventsWithFallback(
+              stream,
+              userId,
+              merged,
+            );
+            this.emitDone(userId);
+            return reply;
+          } catch (err) {
+            if (isAbortError(err)) {
+              if (timeoutController.signal.aborted && !outerSignal?.aborted) {
+                this.logger.warn(
+                  `[chat] userId=${userId} AI_CHAT_TIMEOUT_MS exceeded`,
+                );
+                this.emitError(
+                  userId,
+                  SseErrorCode.AI_TIMEOUT,
+                  'AI 응답 생성 시간이 초과되었습니다.',
+                );
+              } else {
+                this.logger.warn(
+                  `[chat] userId=${userId} aborted (client disconnect or cancel)`,
+                );
+                this.emitError(
+                  userId,
+                  SseErrorCode.CLIENT_ABORT,
+                  '연결이 종료되어 작업을 중단했습니다.',
+                );
+              }
             } else {
-              this.logger.warn(`[chat] userId=${userId} aborted (client disconnect or cancel)`);
+              const msg = err instanceof Error ? err.message : String(err);
+              this.logger.error(
+                `[chat] userId=${userId} ${msg}`,
+                err instanceof Error ? err.stack : undefined,
+              );
               this.emitError(
                 userId,
-                SseErrorCode.CLIENT_ABORT,
-                '연결이 종료되어 작업을 중단했습니다.',
+                SseErrorCode.AI_ERROR,
+                'AI 응답 생성 중 오류가 발생했습니다.',
               );
             }
-          } else {
-            const msg = err instanceof Error ? err.message : String(err);
-            this.logger.error(
-              `[chat] userId=${userId} ${msg}`,
-              err instanceof Error ? err.stack : undefined,
-            );
-            this.emitError(userId, SseErrorCode.AI_ERROR, 'AI 응답 생성 중 오류가 발생했습니다.');
+            throw err;
           }
-          throw err;
-        }
-      });
+        },
+      );
     } finally {
       clearTimeout(timeoutId);
     }
   }
 
+  /** 지정된 ADK 세션에서 후속 대화를 실행하고 SSE 응답을 스트리밍한다. */
   async runSession(
     userId: string,
     sessionId: string,
@@ -557,7 +614,9 @@ export class AiService implements OnModuleInit, OnApplicationShutdown {
       return 'AI agent is not initialized. Please configure GEMINI_API_KEY or GOOGLE_API_KEY.';
     }
 
-    const timeoutMs = Number(this.configService.get('AI_CHAT_TIMEOUT_MS') ?? 120_000);
+    const timeoutMs = Number(
+      this.configService.get('AI_CHAT_TIMEOUT_MS') ?? 120_000,
+    );
     const timeoutController = new AbortController();
     const timeoutId = setTimeout(() => timeoutController.abort(), timeoutMs);
     const merged = options?.signal
@@ -568,73 +627,92 @@ export class AiService implements OnModuleInit, OnApplicationShutdown {
       return await chatContextStorage.run(
         { userId, streamSink: options?.streamSink },
         async () => {
-        try {
-          this.emitStatus(
-            userId,
-            StatusStep.SEARCHING,
-            '매장·예약 세션 정보를 불러오는 중입니다.',
-          );
+          try {
+            this.emitStatus(
+              userId,
+              StatusStep.SEARCHING,
+              '매장·예약 세션 정보를 불러오는 중입니다.',
+            );
 
-          const contextualMessage = await this.buildContextualMessage(userId, message);
+            const contextualMessage = await this.buildGroundedUserMessage(
+              userId,
+              message,
+            );
 
-          this.emitStatus(
-            userId,
-            StatusStep.THINKING,
-            'AI가 예약 가능 여부를 확인하고 있습니다.',
-          );
+            this.emitStatus(
+              userId,
+              StatusStep.THINKING,
+              'AI가 예약 가능 여부를 확인하고 있습니다.',
+            );
 
-          const userMessage: Content = {
-            role: 'user',
-            parts: [{ text: contextualMessage }],
-          };
+            const userMessage: Content = {
+              role: 'user',
+              parts: [{ text: contextualMessage }],
+            };
 
-          const stream = this.runner!.runAsync({
-            userId,
-            sessionId,
-            newMessage: userMessage,
-            abortSignal: merged,
-          });
-          const reply = await this.processEventStream(stream, userId, merged);
-          this.emitDone(userId);
-          return reply;
-        } catch (err) {
-          if (isAbortError(err)) {
-            if (timeoutController.signal.aborted && !options?.signal?.aborted) {
-              this.logger.warn(`[runSession] userId=${userId} AI_CHAT_TIMEOUT_MS exceeded`);
-              this.emitError(
-                userId,
-                SseErrorCode.AI_TIMEOUT,
-                'AI 응답 생성 시간이 초과되었습니다.',
-              );
+            const stream = this.runner!.runAsync({
+              userId,
+              sessionId,
+              newMessage: userMessage,
+              abortSignal: merged,
+            });
+            const reply = await this.streamAgentEventsWithFallback(
+              stream,
+              userId,
+              merged,
+            );
+            this.emitDone(userId);
+            return reply;
+          } catch (err) {
+            if (isAbortError(err)) {
+              if (
+                timeoutController.signal.aborted &&
+                !options?.signal?.aborted
+              ) {
+                this.logger.warn(
+                  `[runSession] userId=${userId} AI_CHAT_TIMEOUT_MS exceeded`,
+                );
+                this.emitError(
+                  userId,
+                  SseErrorCode.AI_TIMEOUT,
+                  'AI 응답 생성 시간이 초과되었습니다.',
+                );
+              } else {
+                this.logger.warn(`[runSession] userId=${userId} aborted`);
+                this.emitError(
+                  userId,
+                  SseErrorCode.CLIENT_ABORT,
+                  '연결이 종료되어 작업을 중단했습니다.',
+                );
+              }
             } else {
-              this.logger.warn(`[runSession] userId=${userId} aborted`);
+              const msg = err instanceof Error ? err.message : String(err);
+              this.logger.error(
+                `[runSession] userId=${userId} ${msg}`,
+                err instanceof Error ? err.stack : undefined,
+              );
               this.emitError(
                 userId,
-                SseErrorCode.CLIENT_ABORT,
-                '연결이 종료되어 작업을 중단했습니다.',
+                SseErrorCode.AI_ERROR,
+                'AI 응답 생성 중 오류가 발생했습니다.',
               );
             }
-          } else {
-            const msg = err instanceof Error ? err.message : String(err);
-            this.logger.error(
-              `[runSession] userId=${userId} ${msg}`,
-              err instanceof Error ? err.stack : undefined,
-            );
-            this.emitError(userId, SseErrorCode.AI_ERROR, 'AI 응답 생성 중 오류가 발생했습니다.');
+            throw err;
           }
-          throw err;
-        }
-      });
+        },
+      );
     } finally {
       clearTimeout(timeoutId);
     }
   }
 
+  /** AI Agent 초기화 완료 여부를 반환한다. */
   get isReady(): boolean {
     return this.runner !== null;
   }
 }
 
+/** 클라이언트 중단과 서버 타임아웃 신호를 하나로 결합한다. */
 function mergeAbortSignals(a: AbortSignal, b: AbortSignal): AbortSignal {
   if (a.aborted) {
     return a;

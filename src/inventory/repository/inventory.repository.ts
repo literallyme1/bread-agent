@@ -4,38 +4,39 @@ import { Inventory } from '../entity/inventory.entity';
 import { CustomException } from '../../common/exception/custom.exception';
 import { ErrorCode } from '../../common/exception/error-code.enum';
 
-/**
- * Inventory DB 접근 담당
- * 재고 관련 핵심 동시성 처리 로직 포함
- */
 @Injectable()
 export class InventoryRepository {
   constructor(private readonly dataSource: DataSource) {}
 
-  /**
-   * store_id + bread_id 조합으로 inventory 조회
-   */
-  async findByStoreAndBread(storeId: number, breadId: number, manager?: EntityManager): Promise<Inventory | null> {
-    const repo = manager ? manager.getRepository(Inventory) : this.dataSource.getRepository(Inventory);
+  /** 매장과 빵 식별자로 재고를 조회한다. */
+  async findByStoreAndBread(
+    storeId: number,
+    breadId: number,
+    manager?: EntityManager,
+  ): Promise<Inventory | null> {
+    const repo = manager
+      ? manager.getRepository(Inventory)
+      : this.dataSource.getRepository(Inventory);
     return repo.findOne({ where: { storeId, breadId }, relations: ['bread'] });
   }
 
-  async findById(id: number, manager?: EntityManager): Promise<Inventory | null> {
-    const repo = manager ? manager.getRepository(Inventory) : this.dataSource.getRepository(Inventory);
+  /** 재고 식별자로 재고를 조회한다. */
+  async findById(
+    id: number,
+    manager?: EntityManager,
+  ): Promise<Inventory | null> {
+    const repo = manager
+      ? manager.getRepository(Inventory)
+      : this.dataSource.getRepository(Inventory);
     return repo.findOne({ where: { id } });
   }
 
-  /**
-   * 조건부 UPDATE 방식으로 재고 차감 (동시성 안전)
-   *
-   * UPDATE inventory
-   *   SET available = available - :qty
-   * WHERE id = :id AND available >= :qty
-   *
-   * affected === 0 이면 재고 부족으로 실패
-   * 낙관적 락 없이 DB 레벨에서 atomically 처리
-   */
-  async decreaseStock(inventoryId: number, qty: number, manager?: EntityManager): Promise<void> {
+  /** 조건부 UPDATE로 가용 재고를 원자적으로 차감한다. */
+  async decreaseAvailableStockAtomically(
+    inventoryId: number,
+    qty: number,
+    manager?: EntityManager,
+  ): Promise<void> {
     const qb = manager
       ? manager.createQueryBuilder()
       : this.dataSource.createQueryBuilder();
@@ -47,16 +48,17 @@ export class InventoryRepository {
       .where('id = :id AND available >= :qty', { id: inventoryId, qty })
       .execute();
 
-    if (result.affected === 0) { // 수정한 행 개수 0
+    if (result.affected === 0) {
       throw new CustomException(ErrorCode.OUT_OF_STOCK);
     }
   }
 
-  /**
-   * 재고 복구 - 예약 취소 시 호출
-   * 취소는 단순 증가이므로 조건 없이 UPDATE
-   */
-  async restoreStock(inventoryId: number, qty: number, manager?: EntityManager): Promise<void> {
+  /** 취소된 예약 수량을 가용 재고로 복구한다. */
+  async restoreCancelledStock(
+    inventoryId: number,
+    qty: number,
+    manager?: EntityManager,
+  ): Promise<void> {
     const qb = manager
       ? manager.createQueryBuilder()
       : this.dataSource.createQueryBuilder();

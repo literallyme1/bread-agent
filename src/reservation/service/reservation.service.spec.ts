@@ -24,7 +24,9 @@ function futurePickupIso(): string {
   return d.toISOString();
 }
 
-function makeInventory(overrides: Partial<Inventory> & { breadName?: string } = {}): Inventory {
+function makeInventory(
+  overrides: Partial<Inventory> & { breadName?: string } = {},
+): Inventory {
   const inv = new Inventory();
   inv.id = overrides.id ?? 10;
   inv.storeId = overrides.storeId ?? 1;
@@ -69,9 +71,11 @@ describe('ReservationService', () => {
     };
 
     dataSource = {
-      transaction: jest.fn().mockImplementation(async (cb: (m: EntityManager) => Promise<any>) =>
-        cb(mockManager as EntityManager),
-      ),
+      transaction: jest
+        .fn()
+        .mockImplementation(async (cb: (m: EntityManager) => Promise<any>) =>
+          cb(mockManager as EntityManager),
+        ),
     } as any;
 
     reservationRepository = {
@@ -83,8 +87,8 @@ describe('ReservationService', () => {
 
     inventoryRepository = {
       findByStoreAndBread: jest.fn(),
-      decreaseStock: jest.fn(),
-      restoreStock: jest.fn(),
+      decreaseAvailableStockAtomically: jest.fn(),
+      restoreCancelledStock: jest.fn(),
     } as any;
 
     storeRepository = {
@@ -139,8 +143,22 @@ describe('ReservationService', () => {
         }) as any,
       );
       inventoryRepository.findByStoreAndBread
-        .mockResolvedValueOnce(makeInventory({ id: 10, breadId: 1, available: 5, breadName: '소금빵' }))
-        .mockResolvedValueOnce(makeInventory({ id: 20, breadId: 2, available: 3, breadName: '고구마빵' }));
+        .mockResolvedValueOnce(
+          makeInventory({
+            id: 10,
+            breadId: 1,
+            available: 5,
+            breadName: '소금빵',
+          }),
+        )
+        .mockResolvedValueOnce(
+          makeInventory({
+            id: 20,
+            breadId: 2,
+            available: 3,
+            breadName: '고구마빵',
+          }),
+        );
 
       const result = await service.holdReservation('1');
 
@@ -163,8 +181,17 @@ describe('ReservationService', () => {
         }) as any,
       );
       inventoryRepository.findByStoreAndBread
-        .mockResolvedValueOnce(makeInventory({ available: 5, breadName: '소금빵' }))
-        .mockResolvedValueOnce(makeInventory({ id: 20, breadId: 2, available: 1, breadName: '고구마빵' }));
+        .mockResolvedValueOnce(
+          makeInventory({ available: 5, breadName: '소금빵' }),
+        )
+        .mockResolvedValueOnce(
+          makeInventory({
+            id: 20,
+            breadId: 2,
+            available: 1,
+            breadName: '고구마빵',
+          }),
+        );
 
       const result = await service.holdReservation('1');
 
@@ -187,48 +214,73 @@ describe('ReservationService', () => {
 
     it('사용자 없으면 USER_NOT_FOUND', async () => {
       reservationRepository.findUserById.mockResolvedValue(null);
-      await expect(service.holdReservation('1')).rejects.toThrow(new CustomException(ErrorCode.USER_NOT_FOUND));
+      await expect(service.holdReservation('1')).rejects.toThrow(
+        new CustomException(ErrorCode.USER_NOT_FOUND),
+      );
     });
 
     it('매장 없으면 STORE_NOT_FOUND', async () => {
       storeRepository.findById.mockResolvedValue(null);
-      await expect(service.holdReservation('1')).rejects.toThrow(new CustomException(ErrorCode.STORE_NOT_FOUND));
+      await expect(service.holdReservation('1')).rejects.toThrow(
+        new CustomException(ErrorCode.STORE_NOT_FOUND),
+      );
     });
 
     it('세션 없으면 400', async () => {
       redisHoldService.getSession.mockResolvedValue(null);
-      await expect(service.holdReservation('1')).rejects.toThrow(BadRequestException);
+      await expect(service.holdReservation('1')).rejects.toThrow(
+        BadRequestException,
+      );
     });
 
     it('필수 필드 누락 시 400', async () => {
       redisHoldService.getSession.mockResolvedValue(
-        baseSession({ last_store_id: undefined, pickup_time: futurePickupIso() }) as any,
+        baseSession({
+          last_store_id: undefined,
+          pickup_time: futurePickupIso(),
+        }) as any,
       );
-      await expect(service.holdReservation('1')).rejects.toThrow(BadRequestException);
+      await expect(service.holdReservation('1')).rejects.toThrow(
+        BadRequestException,
+      );
     });
 
     it('selected_items 비면 400', async () => {
-      redisHoldService.getSession.mockResolvedValue(baseSession({ selected_items: [] }) as any);
-      await expect(service.holdReservation('1')).rejects.toThrow(BadRequestException);
+      redisHoldService.getSession.mockResolvedValue(
+        baseSession({ selected_items: [] }) as any,
+      );
+      await expect(service.holdReservation('1')).rejects.toThrow(
+        BadRequestException,
+      );
     });
 
     it('과거 픽업(유예 5초) → 예약 가능한 시간이 지났습니다', async () => {
       redisHoldService.getSession.mockResolvedValue(
-        baseSession({ pickup_time: new Date(Date.now() - 60_000).toISOString() }) as any,
+        baseSession({
+          pickup_time: new Date(Date.now() - 60_000).toISOString(),
+        }) as any,
       );
-      await expect(service.holdReservation('1')).rejects.toThrow('예약 가능한 시간이 지났습니다');
+      await expect(service.holdReservation('1')).rejects.toThrow(
+        '예약 가능한 시간이 지났습니다',
+      );
     });
 
     it('잘못된 픽업 형식 → 400', async () => {
-      redisHoldService.getSession.mockResolvedValue(baseSession({ pickup_time: 'not-a-date' }) as any);
-      await expect(service.holdReservation('1')).rejects.toThrow(BadRequestException);
+      redisHoldService.getSession.mockResolvedValue(
+        baseSession({ pickup_time: 'not-a-date' }) as any,
+      );
+      await expect(service.holdReservation('1')).rejects.toThrow(
+        BadRequestException,
+      );
     });
 
     it('pickup_time에 Z 없이 KST 벽시각만 있어도 hold 성공', async () => {
       redisHoldService.getSession.mockResolvedValue(
         baseSession({ pickup_time: '2060-06-15T14:00:00' }) as any,
       );
-      inventoryRepository.findByStoreAndBread.mockResolvedValue(makeInventory({ available: 5 }));
+      inventoryRepository.findByStoreAndBread.mockResolvedValue(
+        makeInventory({ available: 5 }),
+      );
 
       const result = await service.holdReservation('1');
       expect(result.success).toBe(true);
@@ -240,9 +292,13 @@ describe('ReservationService', () => {
       redisHoldService.getSession.mockResolvedValue(
         baseSession({ pickup_time: '2060-06-01T23:30:00.000Z' }) as any,
       );
-      inventoryRepository.findByStoreAndBread.mockResolvedValue(makeInventory({ available: 5 }));
+      inventoryRepository.findByStoreAndBread.mockResolvedValue(
+        makeInventory({ available: 5 }),
+      );
 
-      await expect(service.holdReservation('1')).rejects.toThrow(new CustomException(ErrorCode.STORE_CLOSED));
+      await expect(service.holdReservation('1')).rejects.toThrow(
+        new CustomException(ErrorCode.STORE_CLOSED),
+      );
     });
   });
 
@@ -255,8 +311,20 @@ describe('ReservationService', () => {
       storeId: 1,
       pickupTime: futurePickupIso(),
       items: [
-        { inventoryId: 10, breadId: 1, breadName: '소금빵', requestedQty: 2, heldQty: 2 },
-        { inventoryId: 20, breadId: 2, breadName: '고구마빵', requestedQty: 1, heldQty: 1 },
+        {
+          inventoryId: 10,
+          breadId: 1,
+          breadName: '소금빵',
+          requestedQty: 2,
+          heldQty: 2,
+        },
+        {
+          inventoryId: 20,
+          breadId: 2,
+          breadName: '고구마빵',
+          requestedQty: 1,
+          heldQty: 1,
+        },
       ],
       expiresAt: new Date(Date.now() + HOLD_TTL_SECONDS * 1000).toISOString(),
     };
@@ -274,7 +342,9 @@ describe('ReservationService', () => {
 
     it('hold 확정 후 inventory 감소 및 Reservation 생성', async () => {
       redisHoldService.getHold.mockResolvedValue(mockHoldData);
-      inventoryRepository.decreaseStock.mockResolvedValue(undefined);
+      inventoryRepository.decreaseAvailableStockAtomically.mockResolvedValue(
+        undefined,
+      );
 
       const mockReservation = Object.assign(new Reservation(), {
         id: 99,
@@ -309,19 +379,24 @@ describe('ReservationService', () => {
         errorCode: ErrorCode.HOLD_EXPIRED,
         errorPayload: {
           status: 'READY_FOR_SUMMARY',
-          last_error: '임시 예약 시간이 만료되었습니다. 다시 한번 예약 정보를 확인하고 재시도해주세요.',
+          last_error:
+            '임시 예약 시간이 만료되었습니다. 다시 한번 예약 정보를 확인하고 재시도해주세요.',
         },
       });
       expect(redisHoldService.patchCurrentSession).toHaveBeenCalledWith('1', {
         status: 'READY_FOR_SUMMARY',
-        last_error: '임시 예약 시간이 만료되었습니다. 다시 한번 예약 정보를 확인하고 재시도해주세요.',
+        last_error:
+          '임시 예약 시간이 만료되었습니다. 다시 한번 예약 정보를 확인하고 재시도해주세요.',
         hold_token: undefined,
       });
     });
 
     it('세션에 hold_token 없음 → HOLD_EXPIRED + 세션 강등', async () => {
       redisHoldService.getSession.mockResolvedValue(
-        baseSession({ status: 'WAITING_FOR_CONFIRM', hold_token: undefined }) as any,
+        baseSession({
+          status: 'WAITING_FOR_CONFIRM',
+          hold_token: undefined,
+        }) as any,
       );
       redisHoldService.getHold.mockResolvedValue(null);
       await expect(service.confirmHold(confirmDto)).rejects.toMatchObject({
@@ -337,10 +412,13 @@ describe('ReservationService', () => {
     });
 
     it('userId 불일치 → HOLD_USER_MISMATCH', async () => {
-      redisHoldService.getHold.mockResolvedValue({ ...mockHoldData, userId: 99 });
-      await expect(service.confirmHold({ userId: 1, holdToken })).rejects.toThrow(
-        new CustomException(ErrorCode.HOLD_USER_MISMATCH),
-      );
+      redisHoldService.getHold.mockResolvedValue({
+        ...mockHoldData,
+        userId: 99,
+      });
+      await expect(
+        service.confirmHold({ userId: 1, holdToken }),
+      ).rejects.toThrow(new CustomException(ErrorCode.HOLD_USER_MISMATCH));
     });
   });
 });

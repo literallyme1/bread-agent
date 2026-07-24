@@ -1,4 +1,4 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable } from '@nestjs/common';
 import { StoreRepository } from '../repository/store.repository';
 import { SessionService } from '../../session/session.service';
 import { StoreQueryDto } from '../dto/store-query.dto';
@@ -13,27 +13,27 @@ import { ErrorCode } from '../../common/exception/error-code.enum';
 
 @Injectable()
 export class StoreService {
-  private readonly logger = new Logger(StoreService.name);
-
   constructor(
     private readonly storeRepository: StoreRepository,
     private readonly sessionService: SessionService,
   ) {}
 
+  /** 매장·메뉴·재고·취향을 한 번에 조회하고 검색 상태를 동기화한다. */
   async getStores(query: StoreQueryDto): Promise<StoreListResponseDto> {
-    // Server-Driven 세션 동기화: 리셋 판별 → 프로필 저장 → 자동 승격
     await this.sessionService.syncSearchContext({
       userId: query.userId,
       name: query.name,
       storeId: query.storeId,
       station: query.station,
-      preference: query.preference as string[] | undefined,
+      preference: query.preference,
     });
 
-    const rows = await this.storeRepository.findStoresWithBreads(query);
+    const rows =
+      await this.storeRepository.findCompositeRecommendationCandidates(query);
     return mapToStoreListResponse(rows);
   }
 
+  /** 매장 식별자로 상세 정보를 조회한다. */
   async getStoreById(id: number): Promise<StoreDetailDto> {
     const store = await this.storeRepository.findById(id);
     if (!store) {

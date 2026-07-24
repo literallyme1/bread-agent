@@ -48,9 +48,6 @@ export class Inventory {
   @JoinColumn({ name: 'bread_id' })
   bread: Bread;
 
-  /**
-   * inventory_tag 조인 테이블 (composite PK: inventory_id + tag_id)
-   */
   @ManyToMany(() => Tag)
   @JoinTable({
     name: 'inventory_tag',
@@ -58,12 +55,4 @@ export class Inventory {
     inverseJoinColumn: { name: 'tag_id', referencedColumnName: 'id' },
   })
   tags: Tag[];
-
-  /**
-   * 재고 복구 - 예약 취소 시 호출
-   * (실제 DB 반영은 Repository의 restoreStock 참고)
-   */
-  restoreStock(qty: number): void {
-    this.available += qty;
-  }
 }

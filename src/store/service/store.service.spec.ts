@@ -16,7 +16,7 @@ describe('StoreService', () => {
 
   beforeEach(async () => {
     storeRepository = {
-      findStoresWithBreads: jest.fn(),
+      findCompositeRecommendationCandidates: jest.fn(),
       findById: jest.fn(),
     } as any;
 
@@ -55,9 +55,14 @@ describe('StoreService', () => {
           tag_names: ['짭짤', '담백'],
         },
       ];
-      storeRepository.findStoresWithBreads.mockResolvedValue(rawRows);
+      storeRepository.findCompositeRecommendationCandidates.mockResolvedValue(
+        rawRows,
+      );
 
-      const query: StoreQueryDto = { userId: 'user-1', station: Station.DAEJEON };
+      const query: StoreQueryDto = {
+        userId: 'user-1',
+        station: Station.DAEJEON,
+      };
       const result = await service.getStores(query);
 
       expect(result.stores).toHaveLength(1);
@@ -90,16 +95,26 @@ describe('StoreService', () => {
           tag_names: null,
         },
       ];
-      storeRepository.findStoresWithBreads.mockResolvedValue(rawRows);
+      storeRepository.findCompositeRecommendationCandidates.mockResolvedValue(
+        rawRows,
+      );
 
-      const result = await service.getStores({ userId: 'user-1', station: Station.DAEJEON });
+      const result = await service.getStores({
+        userId: 'user-1',
+        station: Station.DAEJEON,
+      });
       expect(result.stores[0].breads[0].preferences).toEqual([]);
     });
 
     it('결과가 없으면 빈 stores 배열 반환', async () => {
-      storeRepository.findStoresWithBreads.mockResolvedValue([]);
+      storeRepository.findCompositeRecommendationCandidates.mockResolvedValue(
+        [],
+      );
 
-      const result = await service.getStores({ userId: 'user-1', station: '없는역' as Station });
+      const result = await service.getStores({
+        userId: 'user-1',
+        station: '없는역' as Station,
+      });
       expect(result.stores).toHaveLength(0);
     });
 
@@ -120,9 +135,14 @@ describe('StoreService', () => {
           tag_names: null,
         },
       ];
-      storeRepository.findStoresWithBreads.mockResolvedValue(rawRows);
+      storeRepository.findCompositeRecommendationCandidates.mockResolvedValue(
+        rawRows,
+      );
 
-      const result = await service.getStores({ userId: 'user-1', station: Station.DAEJEON });
+      const result = await service.getStores({
+        userId: 'user-1',
+        station: Station.DAEJEON,
+      });
       expect(result.stores[0].breads).toHaveLength(0);
     });
 
@@ -157,9 +177,14 @@ describe('StoreService', () => {
           tag_names: ['달콤'],
         },
       ];
-      storeRepository.findStoresWithBreads.mockResolvedValue(rawRows);
+      storeRepository.findCompositeRecommendationCandidates.mockResolvedValue(
+        rawRows,
+      );
 
-      const result = await service.getStores({ userId: 'user-1', station: Station.DAEJEON });
+      const result = await service.getStores({
+        userId: 'user-1',
+        station: Station.DAEJEON,
+      });
 
       expect(result.stores).toHaveLength(2);
       expect(result.stores[0].name).toBe('성심당');
@@ -171,27 +196,45 @@ describe('StoreService', () => {
 
   describe('getStores - pg_trgm 유사 검색 쿼리 위임', () => {
     it('storeName 전달 시 repository에 query 그대로 위임', async () => {
-      storeRepository.findStoresWithBreads.mockResolvedValue([]);
+      storeRepository.findCompositeRecommendationCandidates.mockResolvedValue(
+        [],
+      );
 
-      await service.getStores({ userId: 'user-1', station: Station.DAEJEON, storeName: '하래하래' });
+      await service.getStores({
+        userId: 'user-1',
+        station: Station.DAEJEON,
+        storeName: '하래하래',
+      });
 
-      expect(storeRepository.findStoresWithBreads).toHaveBeenCalledWith(
+      expect(
+        storeRepository.findCompositeRecommendationCandidates,
+      ).toHaveBeenCalledWith(
         expect.objectContaining({ storeName: '하래하래' }),
       );
     });
 
     it('breadName 전달 시 repository에 query 그대로 위임 (오타 보완 대상)', async () => {
-      storeRepository.findStoresWithBreads.mockResolvedValue([]);
+      storeRepository.findCompositeRecommendationCandidates.mockResolvedValue(
+        [],
+      );
 
-      await service.getStores({ userId: 'user-1', station: Station.DAEJEON, breadName: '소금빵집' });
+      await service.getStores({
+        userId: 'user-1',
+        station: Station.DAEJEON,
+        breadName: '소금빵집',
+      });
 
-      expect(storeRepository.findStoresWithBreads).toHaveBeenCalledWith(
+      expect(
+        storeRepository.findCompositeRecommendationCandidates,
+      ).toHaveBeenCalledWith(
         expect.objectContaining({ breadName: '소금빵집' }),
       );
     });
 
     it('preference 배열 전달 시 repository에 배열 그대로 위임 (OR 조건)', async () => {
-      storeRepository.findStoresWithBreads.mockResolvedValue([]);
+      storeRepository.findCompositeRecommendationCandidates.mockResolvedValue(
+        [],
+      );
 
       await service.getStores({
         userId: 'user-1',
@@ -199,8 +242,12 @@ describe('StoreService', () => {
         preference: [Preference.SALTY, Preference.CRISPY],
       });
 
-      expect(storeRepository.findStoresWithBreads).toHaveBeenCalledWith(
-        expect.objectContaining({ preference: [Preference.SALTY, Preference.CRISPY] }),
+      expect(
+        storeRepository.findCompositeRecommendationCandidates,
+      ).toHaveBeenCalledWith(
+        expect.objectContaining({
+          preference: [Preference.SALTY, Preference.CRISPY],
+        }),
       );
     });
   });

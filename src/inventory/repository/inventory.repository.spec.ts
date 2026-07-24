@@ -29,11 +29,13 @@ describe('InventoryRepository', () => {
     repository = new InventoryRepository(mockDataSource as DataSource);
   });
 
-  describe('decreaseStock', () => {
+  describe('decreaseAvailableStockAtomically', () => {
     it('재고가 충분하면 UPDATE 성공 (affected > 0)', async () => {
       mockQb.execute.mockResolvedValue({ affected: 1 });
 
-      await expect(repository.decreaseStock(1, 2)).resolves.not.toThrow();
+      await expect(
+        repository.decreaseAvailableStockAtomically(1, 2),
+      ).resolves.not.toThrow();
 
       // WHERE 절에 available >= qty 조건 포함 검증
       expect(mockQb.where).toHaveBeenCalledWith(
@@ -45,17 +47,19 @@ describe('InventoryRepository', () => {
     it('재고 부족 시 OUT_OF_STOCK 예외 (affected === 0)', async () => {
       mockQb.execute.mockResolvedValue({ affected: 0 });
 
-      await expect(repository.decreaseStock(1, 100)).rejects.toThrow(
-        new CustomException(ErrorCode.OUT_OF_STOCK),
-      );
+      await expect(
+        repository.decreaseAvailableStockAtomically(1, 100),
+      ).rejects.toThrow(new CustomException(ErrorCode.OUT_OF_STOCK));
     });
   });
 
-  describe('restoreStock', () => {
+  describe('restoreCancelledStock', () => {
     it('재고 복구 시 available + qty UPDATE', async () => {
       mockQb.execute.mockResolvedValue({ affected: 1 });
 
-      await expect(repository.restoreStock(1, 2)).resolves.not.toThrow();
+      await expect(
+        repository.restoreCancelledStock(1, 2),
+      ).resolves.not.toThrow();
       expect(mockQb.where).toHaveBeenCalledWith('id = :id', { id: 1 });
     });
   });

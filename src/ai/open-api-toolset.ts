@@ -4,8 +4,6 @@ import type { Schema } from '@google/genai';
 import { Type } from '@google/genai';
 import { chatContextStorage } from './chat-context';
 
-// ─── OpenAPI 3.x document interfaces ────────────────────────────────────────
-
 interface OpenApiSchema {
   type?: string;
   $ref?: string;
@@ -48,13 +46,14 @@ export interface OpenApiDocument {
   components?: OpenApiComponents;
 }
 
-// ─── Internal helpers ────────────────────────────────────────────────────────
-
 const HTTP_METHODS = new Set(['get', 'post', 'put', 'patch', 'delete']);
 
-function resolveRef(schema: OpenApiSchema, components: OpenApiComponents): OpenApiSchema {
+/** OpenAPI 참조 스키마를 실제 컴포넌트 스키마로 변환한다. */
+function resolveOpenApiSchema<T extends OpenApiSchema>(
+  schema: T,
+  components: OpenApiComponents,
+): T {
   if (!schema?.$ref) return schema;
-  // '#/components/schemas/SomeDto' → ['components', 'schemas', 'SomeDto']
   const parts = schema.$ref.replace('#/', '').split('/');
   const root: Record<string, unknown> = { components };
   let current: unknown = root;
@@ -62,7 +61,7 @@ function resolveRef(schema: OpenApiSchema, components: OpenApiComponents): OpenA
     current = (current as Record<string, unknown>)?.[part];
     if (current === undefined) return schema;
   }
-  return (current as OpenApiSchema) ?? schema;
+  return (current as T) ?? schema;
 }
 
 const OPENAPI_TO_GEMINI_TYPE: Record<string, Type> = {
@@ -74,13 +73,15 @@ const OPENAPI_TO_GEMINI_TYPE: Record<string, Type> = {
   object: Type.OBJECT,
 };
 
-function toGeminiSchema(
+/** OpenAPI 스키마를 Gemini Function Tool 입력 스키마로 변환한다. */
+function convertToGeminiSchema(
   schema: OpenApiSchema,
   components: OpenApiComponents,
   descriptionOverride?: string,
 ): Schema {
-  const resolved = resolveRef(schema, components);
-  const geminiType = OPENAPI_TO_GEMINI_TYPE[resolved.type ?? 'string'] ?? Type.STRING;
+  const resolved = resolveOpenApiSchema(schema, components);
+  const geminiType =
+    OPENAPI_TO_GEMINI_TYPE[resolved.type ?? 'string'] ?? Type.STRING;
 
   const result: Record<string, unknown> = { type: geminiType };
 
@@ -90,28 +91,40 @@ function toGeminiSchema(
   if (resolved.enum) result.enum = resolved.enum;
 
   if (resolved.type === 'array' && resolved.items) {
-    result.items = toGeminiSchema(resolveRef(resolved.items, components), components);
+    result.items = convertToGeminiSchema(
+      resolveOpenApiSchema(resolved.items, components),
+      components,
+    );
   }
 
   if (resolved.type === 'object' && resolved.properties) {
     const nested: Record<string, Schema> = {};
     for (const [key, val] of Object.entries(resolved.properties)) {
-      nested[key] = toGeminiSchema(val, components);
+      nested[key] = convertToGeminiSchema(val, components);
     }
     result.properties = nested;
     if (resolved.required) result.required = resolved.required;
   }
 
-  return result as unknown as Schema;
+  return result;
 }
 
-// ─── OpenApiToolset ──────────────────────────────────────────────────────────
+/** Function Tool 입력값을 URL 파라미터에 안전하게 직렬화한다. */
+function serializeToolParameter(value: unknown): string {
+  if (
+    typeof value === 'string' ||
+    typeof value === 'number' ||
+    typeof value === 'boolean' ||
+    typeof value === 'bigint'
+  ) {
+    return String(value);
+  }
+  if (value === null || value === undefined) {
+    return '';
+  }
+  return JSON.stringify(value);
+}
 
-/**
- * An ADK BaseToolset that reads an OpenAPI 3.x document and generates a
- * FunctionTool for every operation. Each tool's execute handler makes an
- * HTTP call to the live API server so the LLM can drive real actions.
- */
 export class OpenApiToolset extends BaseToolset {
   private readonly _tools: FunctionTool[];
 
@@ -124,6 +137,7 @@ export class OpenApiToolset extends BaseToolset {
     this._tools = this.buildTools();
   }
 
+  /** Swagger operation을 실행 가능한 Gemini Function Tool 목록으로 생성한다. */
   private buildTools(): FunctionTool[] {
     const tools: FunctionTool[] = [];
     const paths = this.swaggerDoc.paths ?? {};
@@ -135,51 +149,67 @@ export class OpenApiToolset extends BaseToolset {
         if (!operation?.operationId) continue;
         if (this.excludedOperations.has(operation.operationId)) continue;
 
-        const tool = this.createFunctionTool(path, method, operation, components);
+        const tool = this.createApiFunctionTool(
+          path,
+          method,
+          operation,
+          components,
+        );
         if (tool) tools.push(tool);
       }
     }
     return tools;
   }
 
-  private createFunctionTool(
+  /** API operation의 파라미터와 HTTP 실행기를 하나의 Function Tool로 구성한다. */
+  private createApiFunctionTool(
     path: string,
     method: string,
     operation: OpenApiOperation,
     components: OpenApiComponents,
   ): FunctionTool | null {
-    const { operationId, summary, description, parameters = [], requestBody } = operation;
+    const {
+      operationId,
+      summary,
+      description,
+      parameters = [],
+      requestBody,
+    } = operation;
     if (!operationId) return null;
 
     const properties: Record<string, Schema> = {};
     const required: string[] = [];
-    // Track where each param lives so the execute handler can route it correctly
     const paramMeta: Record<string, { in: string }> = {};
 
-    // Path / query parameters (헤더 파라미터는 chatContextStorage가 자동 주입하므로 스키마 제외)
     for (const param of parameters) {
       if (param.in === 'header') continue;
-      const schema = resolveRef(param.schema ?? {}, components);
-      properties[param.name] = toGeminiSchema(schema, components, param.description);
+      const schema = resolveOpenApiSchema(param.schema ?? {}, components);
+      properties[param.name] = convertToGeminiSchema(
+        schema,
+        components,
+        param.description,
+      );
       paramMeta[param.name] = { in: param.in };
       if (param.required) required.push(param.name);
     }
 
-    // Request body — flatten top-level properties into the tool parameters
     const bodyParamNames: string[] = [];
     if (requestBody) {
-      const resolvedBody = resolveRef(
-        requestBody as unknown as OpenApiSchema,
-        components,
-      ) as unknown as OpenApiRequestBody;
+      const resolvedBody = resolveOpenApiSchema(requestBody, components);
       const bodySchema = resolvedBody.content?.['application/json']?.schema;
       if (bodySchema) {
-        const resolved = resolveRef(bodySchema, components);
-        for (const [propName, propSchema] of Object.entries(resolved.properties ?? {})) {
-          properties[propName] = toGeminiSchema(resolveRef(propSchema, components), components);
+        const resolved = resolveOpenApiSchema(bodySchema, components);
+        for (const [propName, propSchema] of Object.entries(
+          resolved.properties ?? {},
+        )) {
+          properties[propName] = convertToGeminiSchema(
+            resolveOpenApiSchema(propSchema, components),
+            components,
+          );
           bodyParamNames.push(propName);
         }
-        if (Array.isArray(resolved.required)) required.push(...resolved.required);
+        if (Array.isArray(resolved.required))
+          required.push(...resolved.required);
       }
     }
 
@@ -187,9 +217,8 @@ export class OpenApiToolset extends BaseToolset {
       type: Type.OBJECT,
       properties,
       ...(required.length > 0 ? { required } : {}),
-    } as unknown as Schema;
+    };
 
-    // Capture all closure variables by value
     const capturedBaseUrl = this.baseUrl;
     const capturedMethod = method.toUpperCase();
     const capturedPath = path;
@@ -203,30 +232,30 @@ export class OpenApiToolset extends BaseToolset {
       execute: async (input: unknown) => {
         const params = (input ?? {}) as Record<string, unknown>;
 
-        // 1. Substitute path parameters
         let resolvedPath = capturedPath;
         for (const [name, meta] of Object.entries(capturedParamMeta)) {
           if (meta.in === 'path' && params[name] !== undefined) {
-            resolvedPath = resolvedPath.replace(`{${name}}`, String(params[name]));
+            resolvedPath = resolvedPath.replace(
+              `{${name}}`,
+              serializeToolParameter(params[name]),
+            );
           }
         }
 
-        // 2. Build query string
         const qs = new URLSearchParams();
         for (const [name, meta] of Object.entries(capturedParamMeta)) {
           if (meta.in === 'query' && params[name] !== undefined) {
             const val = params[name];
             if (Array.isArray(val)) {
-              (val as unknown[]).forEach((v) => qs.append(name, String(v)));
+              val.forEach((v) => qs.append(name, serializeToolParameter(v)));
             } else {
-              qs.set(name, String(val));
+              qs.set(name, serializeToolParameter(val));
             }
           }
         }
         const queryString = qs.toString();
         const url = `${capturedBaseUrl}${resolvedPath}${queryString ? `?${queryString}` : ''}`;
 
-        // 3. Build JSON request body
         let body: string | undefined;
         if (capturedBodyParamNames.length > 0) {
           const bodyObj: Record<string, unknown> = {};
@@ -237,12 +266,11 @@ export class OpenApiToolset extends BaseToolset {
         }
 
         try {
-          // AsyncLocalStorage에서 신뢰할 수 있는 userId를 읽어 헤더에 주입.
-          // chat() 스코프 외부에서 호출되면 undefined → 헤더 미포함.
           const chatCtx = chatContextStorage.getStore();
           const requestHeaders: Record<string, string> = {};
           if (body) requestHeaders['Content-Type'] = 'application/json';
-          if (chatCtx?.userId) requestHeaders['X-Chat-User-Id'] = chatCtx.userId;
+          if (chatCtx?.userId)
+            requestHeaders['X-Chat-User-Id'] = chatCtx.userId;
 
           const response = await fetch(url, {
             method: capturedMethod,
@@ -251,7 +279,10 @@ export class OpenApiToolset extends BaseToolset {
           });
 
           if (!response.ok) {
-            return { error: `HTTP ${response.status}`, message: await response.text() };
+            return {
+              error: `HTTP ${response.status}`,
+              message: await response.text(),
+            };
           }
           return (await response.json()) as unknown;
         } catch (err) {
@@ -261,15 +292,18 @@ export class OpenApiToolset extends BaseToolset {
     });
   }
 
-  async getTools(context?: ReadonlyContext): Promise<BaseTool[]> {
-    if (!context) return [...this._tools];
-    return this._tools.filter((tool) => this.isToolSelected(tool, context));
+  /** 현재 실행 컨텍스트에서 허용된 Function Tool 목록을 반환한다. */
+  getTools(context?: ReadonlyContext): Promise<BaseTool[]> {
+    const tools = context
+      ? this._tools.filter((tool) => this.isToolSelected(tool, context))
+      : [...this._tools];
+    return Promise.resolve(tools);
   }
 
-  async close(): Promise<void> {
-    // No external connections to release
-  }
+  /** Toolset 종료 시 정리 지점을 제공한다. */
+  async close(): Promise<void> {}
 
+  /** 자동 생성된 Function Tool 개수를 반환한다. */
   get toolCount(): number {
     return this._tools.length;
   }

@@ -31,7 +31,10 @@ export class StoreDto {
   @ApiProperty({ example: '강남역', description: '인근 지하철역' })
   station: string;
 
-  @ApiProperty({ example: '서울 강남구 강남대로 100', description: '매장 주소' })
+  @ApiProperty({
+    example: '서울 강남구 강남대로 100',
+    description: '매장 주소',
+  })
   address: string;
 
   @ApiProperty({ example: '09:00', description: '영업 시작 시간 (HH:mm)' })
@@ -73,21 +76,24 @@ export class StoreListResponseDto {
   }
 }
 
+export interface StoreRecommendationRow {
+  store_id: number;
+  store_name: string;
+  store_station: string;
+  store_address: string;
+  store_open_time: string;
+  store_close_time: string;
+  inv_id: number;
+  bread_id: number;
+  bread_name: string;
+  inv_price: number;
+  inv_available: number;
+  tag_names: string[] | null;
+}
+
+/** 합성 조회 결과를 매장별 추천 응답으로 그룹화한다. */
 export function mapToStoreListResponse(
-  rows: {
-    store_id: number;
-    store_name: string;
-    store_station: string;
-    store_address: string;
-    store_open_time: string;
-    store_close_time: string;
-    inv_id: number;
-    bread_id: number;
-    bread_name: string;
-    inv_price: number;
-    inv_available: number;
-    tag_names: string[] | null;
-  }[],
+  rows: StoreRecommendationRow[],
 ): StoreListResponseDto {
   const storeMap = new Map<number, StoreDto>();
 
